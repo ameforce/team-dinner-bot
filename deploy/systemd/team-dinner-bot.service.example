@@ -1,0 +1,26 @@
+[Unit]
+Description=Team Dinner Bot Slack Socket Mode service
+After=network.target
+
+[Service]
+Type=simple
+User=team-dinner-bot
+WorkingDirectory=/opt/team-dinner-bot
+EnvironmentFile=/opt/team-dinner-bot/.env
+ExecStart=/opt/team-dinner-bot/.venv/bin/python -B -m app.main
+Restart=on-failure
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/team-dinner-bot/data
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

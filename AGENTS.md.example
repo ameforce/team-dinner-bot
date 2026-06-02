@@ -1,0 +1,28 @@
+# Repository Instructions
+
+This file is a public template for local operator guidance. Copy it to
+`AGENTS.md` in your clone and customize that local file for your own host,
+deployment path, process manager, and operational rules.
+
+`AGENTS.md` is intentionally ignored so clone-specific instructions do not
+normally appear in `git diff`.
+
+## Local Deployment Notes
+
+- Set secrets and environment-specific values in `.env`.
+- Keep `.env`, runtime databases, lock files, and local deployment overlays out
+  of commits and published artifacts.
+- If you use systemd, copy
+  `deploy/systemd/team-dinner-bot.service.example` to
+  `deploy/systemd/team-dinner-bot.service`, customize it locally, then install
+  it according to your operating system practices.
+- Avoid running more than one Socket Mode worker for the same Slack app at the
+  same time.
+
+## Suggested Local Commands
+
+```powershell
+copy config.example.env .env
+copy AGENTS.md.example AGENTS.md
+copy deploy\systemd\team-dinner-bot.service.example deploy\systemd\team-dinner-bot.service
+```

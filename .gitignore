@@ -1,0 +1,51 @@
+# Local secrets and configuration
+.env
+.env.*
+*.secret
+*.secrets
+secrets/
+!config.example.env
+
+# Local operator/deployment overlays
+AGENTS.md
+deploy/systemd/team-dinner-bot.service
+
+# Runtime data
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.db-journal
+data/*.sqlite-journal
+data/*.sqlite3-journal
+data/*.db-wal
+data/*.sqlite-wal
+data/*.sqlite3-wal
+data/*.db-shm
+data/*.sqlite-shm
+data/*.sqlite3-shm
+*.lock
+
+# Local workflow/session artifacts
+.omx/
+.playwright-cli/
+
+# Python / build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+team_dinner_bot.egg-info/
+
+# Logs and local output
+*.log
+logs/
+tmp/
+temp/
