@@ -56,6 +56,7 @@ class WorkflowRun(Base):
     poll_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     poll_semantics: Mapped[str | None] = mapped_column(String(32), default="unavailable", nullable=True)
     winning_option_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    selection_audit_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     target_member_ids_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     assignee_user_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     thread_ts: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -112,6 +113,8 @@ def _migrate_existing_sqlite(engine) -> None:
             conn.execute(text("ALTER TABLE workflow_runs ADD COLUMN target_member_ids_json TEXT"))
         if "poll_semantics" not in columns:
             conn.execute(text("ALTER TABLE workflow_runs ADD COLUMN poll_semantics VARCHAR(32)"))
+        if "selection_audit_json" not in columns:
+            conn.execute(text("ALTER TABLE workflow_runs ADD COLUMN selection_audit_json TEXT"))
 
 
 def schedule_to_json(spec_dict: dict) -> str:

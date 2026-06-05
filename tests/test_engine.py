@@ -315,6 +315,68 @@ def test_close_poll_no_votes_picks_zero_unavailable_date(
     assert m.MSG_NO_VOTES_SKIP not in texts
 
 
+def test_close_poll_records_date_selection_audit(engine, session_factory, monkeypatch):
+    engine.start_channel_run(CHANNEL, replace=True)
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        run = WorkflowRepository(session).get_open_run(ch.id)
+        run_id = run.id
+
+    monkeypatch.setattr(
+        "app.workflow.engine.collect_attendee_emails",
+        lambda _session, _client, _members: (["a@example.com"], []),
+    )
+    monkeypatch.setattr("app.workflow.engine.random.choice", lambda pool: pool[0])
+
+    engine.close_poll(run_id)
+
+    with session_factory() as session:
+        run = WorkflowRepository(session).get_run(run_id)
+        audit = json.loads(run.selection_audit_json)
+
+    date_audit = audit["date"]
+    assert audit["schema_version"] == 1
+    assert date_audit["poll_semantics"] == "unavailable"
+    assert date_audit["candidate_pool"]
+    assert date_audit["selection_pool"] == date_audit["candidate_pool"]
+    assert date_audit["selected"] == date_audit["candidate_pool"][0]
+    assert date_audit["counts"] == {iso: 0 for iso in date_audit["candidate_pool"]}
+
+
+def test_close_poll_records_assignee_selection_audit(
+    engine, session_factory, slack_client, monkeypatch
+):
+    slack_client.conversations_members.return_value = {"members": ["U1", "U2", "U3"]}
+    engine.start_channel_run(CHANNEL, replace=True)
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        run = WorkflowRepository(session).get_open_run(ch.id)
+        WorkflowRepository(session).record_assignee(ch.id, "U2")
+        run_id = run.id
+
+    monkeypatch.setattr(
+        "app.workflow.engine.collect_attendee_emails",
+        lambda _session, _client, _members: (["a@example.com"], []),
+    )
+
+    def choose(pool):
+        return pool[-1]
+
+    monkeypatch.setattr("app.workflow.engine.random.choice", choose)
+
+    engine.close_poll(run_id)
+
+    with session_factory() as session:
+        run = WorkflowRepository(session).get_run(run_id)
+        audit = json.loads(run.selection_audit_json)
+
+    assignee_audit = audit["assignee"]
+    assert audit["schema_version"] == 1
+    assert assignee_audit["candidate_pool"] == ["U1", "U3"]
+    assert assignee_audit["previous_assignee"] == "U2"
+    assert assignee_audit["selected"] == "U3"
+
+
 def test_close_poll_with_votes(engine, session_factory, slack_client, monkeypatch):
     engine.start_channel_run(CHANNEL, replace=True)
     vote_date = _first_poll_date(slack_client)
