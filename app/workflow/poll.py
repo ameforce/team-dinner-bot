@@ -93,15 +93,22 @@ def _format_unavailable_lines(
 
 
 def tally_votes(votes_by_user: dict[str, set[str]]) -> tuple[str | None, dict[str, int]]:
+    winner, counts, _selection_pool = tally_votes_with_pool(votes_by_user)
+    return winner, counts
+
+
+def tally_votes_with_pool(
+    votes_by_user: dict[str, set[str]]
+) -> tuple[str | None, dict[str, int], list[str]]:
     counts: Counter[str] = Counter()
     for dates in votes_by_user.values():
         for d in dates:
             counts[d] += 1
     if not counts:
-        return None, dict(counts)
+        return None, dict(counts), []
     max_votes = max(counts.values())
     tied = sorted(d for d, c in counts.items() if c == max_votes)
-    return tied[0], dict(counts)
+    return tied[0], dict(counts), tied
 
 
 def choose_dinner_date(
@@ -110,6 +117,20 @@ def choose_dinner_date(
     *,
     choose: Callable[[list[str]], str] = random.choice,
 ) -> tuple[str | None, dict[str, int]]:
+    winner, counts, _selection_pool = choose_dinner_date_with_pool(
+        unavailable_by_user,
+        candidate_date_isos,
+        choose=choose,
+    )
+    return winner, counts
+
+
+def choose_dinner_date_with_pool(
+    unavailable_by_user: dict[str, set[str]],
+    candidate_date_isos: list[str],
+    *,
+    choose: Callable[[list[str]], str] = random.choice,
+) -> tuple[str | None, dict[str, int], list[str]]:
     counts: Counter[str] = Counter({iso: 0 for iso in candidate_date_isos})
     valid = set(candidate_date_isos)
     for dates in unavailable_by_user.values():
@@ -117,13 +138,13 @@ def choose_dinner_date(
             if date_iso in valid:
                 counts[date_iso] += 1
     if not candidate_date_isos:
-        return None, dict(counts)
+        return None, dict(counts), []
     zero_unavailable = [iso for iso in candidate_date_isos if counts[iso] == 0]
     if zero_unavailable:
-        return choose(zero_unavailable), dict(counts)
+        return choose(zero_unavailable), dict(counts), zero_unavailable
     min_count = min(counts[iso] for iso in candidate_date_isos)
     best = [iso for iso in candidate_date_isos if counts[iso] == min_count]
-    return choose(best), dict(counts)
+    return choose(best), dict(counts), best
 
 
 def winning_option_json(date_iso: str, counts: dict[str, int]) -> str:

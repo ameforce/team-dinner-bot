@@ -3,7 +3,13 @@ from datetime import date
 
 from datetime import datetime
 
-from app.workflow.poll import choose_dinner_date, poll_blocks, tally_votes
+from app.workflow.poll import (
+    choose_dinner_date,
+    choose_dinner_date_with_pool,
+    poll_blocks,
+    tally_votes,
+    tally_votes_with_pool,
+)
 
 
 def test_tally_plurality():
@@ -44,6 +50,24 @@ def test_choose_dinner_date_prefers_zero_unavailable_dates_randomly():
     }
 
 
+def test_choose_dinner_date_with_pool_returns_the_random_selection_pool():
+    votes = {
+        "U1": {"2026-06-10"},
+        "U2": {"2026-06-10", "2026-06-17"},
+    }
+
+    winner, counts, selection_pool = choose_dinner_date_with_pool(
+        votes,
+        ["2026-06-10", "2026-06-17", "2026-06-24", "2026-06-25"],
+        choose=lambda options: options[-1],
+    )
+
+    assert winner == "2026-06-25"
+    assert selection_pool == ["2026-06-24", "2026-06-25"]
+    assert counts["2026-06-24"] == 0
+    assert counts["2026-06-25"] == 0
+
+
 def test_choose_dinner_date_falls_back_to_minimum_unavailable_randomly():
     votes = {
         "U1": {"2026-06-10", "2026-06-17"},
@@ -66,6 +90,16 @@ def test_choose_dinner_date_falls_back_to_minimum_unavailable_randomly():
     assert counts["2026-06-10"] == 2
     assert counts["2026-06-17"] == 1
     assert counts["2026-06-24"] == 1
+
+
+def test_tally_votes_with_pool_returns_plurality_pool():
+    votes = {"U1": {"2026-06-20"}, "U2": {"2026-06-15"}}
+
+    winner, counts, selection_pool = tally_votes_with_pool(votes)
+
+    assert winner == "2026-06-15"
+    assert counts == {"2026-06-20": 1, "2026-06-15": 1}
+    assert selection_pool == ["2026-06-15", "2026-06-20"]
 
 
 def test_tally_tie_earliest():

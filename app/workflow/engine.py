@@ -29,10 +29,10 @@ from app.integrations.slack_users import (
 from app.settings_defaults import clamp_poll_duration_hours
 from app.workflow.dates import business_days_rest_of_month
 from app.workflow.poll import (
-    choose_dinner_date,
+    choose_dinner_date_with_pool,
     format_tally_message,
     poll_blocks,
-    tally_votes,
+    tally_votes_with_pool,
     winning_option_json,
 )
 from app.workflow.participants import (
@@ -45,6 +45,7 @@ from app.workflow.participants import (
 from app.workflow.states import WorkflowState
 
 logger = logging.getLogger(__name__)
+SELECTION_AUDIT_SCHEMA_VERSION = 1
 
 
 def _candidate_date_isos(run, ch: Channel) -> set[str]:
@@ -253,9 +254,13 @@ class WorkflowEngine:
             candidate_isos = _candidate_date_iso_list(run, ch)
             votes = _filter_votes_to_candidates(wf.votes_by_user(run_id), set(candidate_isos))
             if run.poll_semantics == "unavailable":
-                winner, counts = choose_dinner_date(votes, candidate_isos, choose=random.choice)
+                winner, counts, date_selection_pool = choose_dinner_date_with_pool(
+                    votes,
+                    candidate_isos,
+                    choose=random.choice,
+                )
             else:
-                winner, counts = tally_votes(votes)
+                winner, counts, date_selection_pool = tally_votes_with_pool(votes)
             if not winner:
                 self.client.chat_postMessage(
                     channel=ch.channel_id,
@@ -268,6 +273,22 @@ class WorkflowEngine:
                 run,
                 state=WorkflowState.POLL_CLOSED,
                 winning_option_json=winning_option_json(winner, counts),
+                selection_audit_json=_merge_selection_audit(
+                    run.selection_audit_json,
+                    date=_date_audit_payload(
+                        candidate_pool=candidate_isos,
+                        selection_pool=date_selection_pool,
+                        selected=winner,
+                        counts=counts,
+                        poll_semantics=run.poll_semantics,
+                    ),
+                ),
+            )
+            logger.info(
+                "date_selection_audit run_id=%s channel_id=%s selected=%s",
+                run.id,
+                ch.channel_id,
+                winner,
             )
             slack_channel_id = ch.channel_id
             thread_ts = run.thread_ts
@@ -291,10 +312,13 @@ class WorkflowEngine:
             ch = session.get(Channel, run.channel_id)
             if not ch:
                 return
-            members = _target_member_ids_for_run(run) or list_human_member_ids(
-                self.client,
-                slack_channel_id,
-            )
+            target_member_ids = _target_member_ids_for_run(run)
+            if target_member_ids:
+                members = target_member_ids
+                member_source = "target_member_snapshot"
+            else:
+                members = list_human_member_ids(self.client, slack_channel_id)
+                member_source = "current_channel_members"
             current_member_ids = list_human_member_ids(self.client, slack_channel_id)
             calendar_invitees = _calendar_invitees_for_channel(ch, current_member_ids)
             required_slack_ids = [
@@ -336,7 +360,27 @@ class WorkflowEngine:
                 )
                 return
             assignee = random.choice(pool)
-            wf.update_run(run, state=WorkflowState.BOOKING_ASSIGNED, assignee_user_id=assignee)
+            wf.update_run(
+                run,
+                state=WorkflowState.BOOKING_ASSIGNED,
+                assignee_user_id=assignee,
+                selection_audit_json=_merge_selection_audit(
+                    run.selection_audit_json,
+                    assignee=_assignee_audit_payload(
+                        member_source=member_source,
+                        target_member_ids=members,
+                        previous_assignee=last,
+                        candidate_pool=pool,
+                        selected=assignee,
+                    ),
+                ),
+            )
+            logger.info(
+                "assignee_selection_audit run_id=%s channel_id=%s selected=%s",
+                run.id,
+                slack_channel_id,
+                assignee,
+            )
             wf.record_assignee(ch.id, assignee)
             booking_url = ch.booking_url_template or m.MSG_BOOKING_URL_MISSING
             winner = {}
@@ -439,6 +483,55 @@ class WorkflowEngine:
                 ),
             )
         return m.MSG_BOOKING_DONE_OK
+
+
+def _date_audit_payload(
+    *,
+    candidate_pool: list[str],
+    selection_pool: list[str],
+    selected: str,
+    counts: dict[str, int],
+    poll_semantics: str | None,
+) -> dict[str, Any]:
+    return {
+        "candidate_pool": candidate_pool,
+        "selection_pool": selection_pool,
+        "selected": selected,
+        "counts": counts,
+        "poll_semantics": poll_semantics,
+    }
+
+
+def _assignee_audit_payload(
+    *,
+    member_source: str,
+    target_member_ids: list[str],
+    previous_assignee: str | None,
+    candidate_pool: list[str],
+    selected: str,
+) -> dict[str, Any]:
+    return {
+        "member_source": member_source,
+        "target_member_ids": target_member_ids,
+        "previous_assignee": previous_assignee,
+        "candidate_pool": candidate_pool,
+        "selected": selected,
+    }
+
+
+def _merge_selection_audit(existing_json: str | None, **sections: dict[str, Any]) -> str:
+    if existing_json:
+        try:
+            audit = json.loads(existing_json)
+        except json.JSONDecodeError:
+            logger.exception("Invalid selection_audit_json; replacing audit payload")
+            audit = {}
+    else:
+        audit = {"schema_version": SELECTION_AUDIT_SCHEMA_VERSION}
+    audit["schema_version"] = SELECTION_AUDIT_SCHEMA_VERSION
+    for key, value in sections.items():
+        audit[key] = value
+    return json.dumps(audit, ensure_ascii=False, sort_keys=True)
 
 
 def _target_member_ids_for_run(run) -> list[str]:
