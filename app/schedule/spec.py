@@ -40,6 +40,9 @@ class ScheduleSpec(BaseModel):
     weekday: int | None = Field(default=None, ge=0, le=4)
     day: int | None = Field(default=None, ge=1, le=28)
     nth: int | None = Field(default=None, ge=-1, le=4)
+    month_interval: int = Field(default=1, ge=1, le=12)
+    month_anchor_year: int | None = Field(default=None, ge=1970, le=9999)
+    month_anchor_month: int | None = Field(default=None, ge=1, le=12)
     hour: int = Field(default=10, ge=0, le=23)
     minute: int = Field(default=0, ge=0, le=59)
 
@@ -53,15 +56,16 @@ class ScheduleSpec(BaseModel):
     def describe_ko(self) -> str:
         if self.type == ScheduleType.WEEKLY_WEEKDAY and self.weekday is not None:
             return f"매주 {weekday_label_ko(self.weekday)}요일 {self.hour:02d}:{self.minute:02d}"
+        month_prefix = "매월" if self.month_interval == 1 else f"{self.month_interval}개월마다"
         if self.type == ScheduleType.MONTHLY_DAY_OF_MONTH and self.day is not None:
-            return f"매월 {self.day}일 {self.hour:02d}:{self.minute:02d}"
+            return f"{month_prefix} {self.day}일 {self.hour:02d}:{self.minute:02d}"
         if (
             self.type == ScheduleType.MONTHLY_NTH_WEEKDAY
             and self.weekday is not None
             and self.nth is not None
         ):
             nth_label = "마지막" if self.nth == -1 else f"{self.nth}번째"
-            return f"매월 {nth_label} {weekday_label_ko(self.weekday)}요일 {self.hour:02d}:{self.minute:02d}"
+            return f"{month_prefix} {nth_label} {weekday_label_ko(self.weekday)}요일 {self.hour:02d}:{self.minute:02d}"
         return "미설정"
 
     def next_run_after(self, after: datetime, tz_name: str) -> datetime:
@@ -79,6 +83,26 @@ class ScheduleSpec(BaseModel):
             return self._next_monthly_nth_weekday(after, tz)
         raise ValueError(f"Unsupported schedule type: {self.type}")
 
+    def with_month_anchor(self, anchor: datetime, tz_name: str) -> ScheduleSpec:
+        tz = ZoneInfo(tz_name)
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=tz)
+        else:
+            anchor = anchor.astimezone(tz)
+        if self.type not in {
+            ScheduleType.MONTHLY_DAY_OF_MONTH,
+            ScheduleType.MONTHLY_NTH_WEEKDAY,
+        } or self.month_interval == 1:
+            return self.model_copy(
+                update={"month_anchor_year": None, "month_anchor_month": None}
+            )
+        return self.model_copy(
+            update={
+                "month_anchor_year": anchor.year,
+                "month_anchor_month": anchor.month,
+            }
+        )
+
     def _at_time(self, d: date, tz: ZoneInfo) -> datetime:
         return datetime(d.year, d.month, d.day, self.hour, self.minute, tzinfo=tz)
 
@@ -94,33 +118,25 @@ class ScheduleSpec(BaseModel):
 
     def _next_monthly_day(self, after: datetime, tz: ZoneInfo) -> datetime:
         assert self.day is not None
-        year, month = after.year, after.month
+        year, month = self._first_monthly_candidate_month(after)
         for _ in range(24):
             day = min(self.day, self._last_day_of_month(year, month))
             candidate = self._at_time(date(year, month, day), tz)
             if candidate > after:
                 return candidate
-            if month == 12:
-                year += 1
-                month = 1
-            else:
-                month += 1
+            year, month = self._add_months(year, month, self.month_interval)
         raise RuntimeError("Could not compute next monthly day within 24 months")
 
     def _next_monthly_nth_weekday(self, after: datetime, tz: ZoneInfo) -> datetime:
         assert self.weekday is not None and self.nth is not None
-        year, month = after.year, after.month
+        year, month = self._first_monthly_candidate_month(after)
         for _ in range(24):
             candidate_date = self._nth_weekday_in_month(year, month, self.weekday, self.nth)
             if candidate_date:
                 candidate = self._at_time(candidate_date, tz)
                 if candidate > after:
                     return candidate
-            if month == 12:
-                year += 1
-                month = 1
-            else:
-                month += 1
+            year, month = self._add_months(year, month, self.month_interval)
         raise RuntimeError("Could not compute next nth weekday within 24 months")
 
     @staticmethod
@@ -130,6 +146,32 @@ class ScheduleSpec(BaseModel):
         else:
             next_month = date(year, month + 1, 1)
         return (next_month - timedelta(days=1)).day
+
+    @staticmethod
+    def _add_months(year: int, month: int, months: int) -> tuple[int, int]:
+        next_month = date(year, month, 1) + relativedelta(months=months)
+        return next_month.year, next_month.month
+
+    def _first_monthly_candidate_month(self, after: datetime) -> tuple[int, int]:
+        if (
+            self.month_interval == 1
+            or self.month_anchor_year is None
+            or self.month_anchor_month is None
+        ):
+            return after.year, after.month
+
+        anchor_index = self.month_anchor_year * 12 + self.month_anchor_month - 1
+        after_index = after.year * 12 + after.month - 1
+        if after_index <= anchor_index:
+            candidate_index = anchor_index
+        else:
+            months_since_anchor = after_index - anchor_index
+            remainder = months_since_anchor % self.month_interval
+            candidate_index = after_index
+            if remainder:
+                candidate_index += self.month_interval - remainder
+        year, month_zero_based = divmod(candidate_index, 12)
+        return year, month_zero_based + 1
 
     @staticmethod
     def _nth_weekday_in_month(year: int, month: int, weekday: int, nth: int) -> date | None:

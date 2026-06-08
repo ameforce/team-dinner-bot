@@ -44,3 +44,8 @@ def test_sqlite_migration_adds_selection_audit_json_to_existing_workflow_runs(tm
         rows = conn.execute(text("PRAGMA table_info(workflow_runs)")).mappings().all()
     columns = {row["name"] for row in rows}
     assert "selection_audit_json" in columns
+
+    with engine.begin() as conn:
+        channel_rows = conn.execute(text("PRAGMA table_info(channels)")).mappings().all()
+    channel_columns = {row["name"] for row in channel_rows}
+    assert "automatic_execution_enabled" in channel_columns

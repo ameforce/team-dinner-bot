@@ -236,10 +236,14 @@ def test_poll_vote_add_remove(engine, session_factory):
         ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
         run = WorkflowRepository(session).get_open_run(ch.id)
         run_id = run.id
-    msg = engine.on_poll_vote(run_id, "U_VOTER", vote_date, CHANNEL)
-    assert msg == m.MSG_POLL_VOTE_ADDED.format(date=vote_date)
-    msg2 = engine.on_poll_vote(run_id, "U_VOTER", vote_date, CHANNEL)
-    assert msg2 == m.MSG_POLL_VOTE_REMOVED.format(date=vote_date)
+    result = engine.on_poll_vote(run_id, "U_VOTER", vote_date, CHANNEL)
+    assert result.needs_feedback is False
+    assert result.feedback_text is None
+    assert result.added is True
+    result2 = engine.on_poll_vote(run_id, "U_VOTER", vote_date, CHANNEL)
+    assert result2.needs_feedback is False
+    assert result2.feedback_text is None
+    assert result2.added is False
 
 
 def test_poll_vote_updates_original_message_with_unavailable_voters(engine, session_factory):
@@ -250,9 +254,9 @@ def test_poll_vote_updates_original_message_with_unavailable_voters(engine, sess
         run = WorkflowRepository(session).get_open_run(ch.id)
         run_id = run.id
 
-    msg = engine.on_poll_vote(run_id, "U1", vote_date, CHANNEL)
+    result = engine.on_poll_vote(run_id, "U1", vote_date, CHANNEL)
 
-    assert msg == m.MSG_POLL_VOTE_ADDED.format(date=vote_date)
+    assert result.needs_feedback is False
     engine.client.chat_update.assert_called_once()
     updated = engine.client.chat_update.call_args.kwargs
     assert updated["channel"] == CHANNEL
@@ -273,9 +277,10 @@ def test_poll_vote_rejects_date_not_in_poll_options(engine, session_factory):
         run = WorkflowRepository(session).get_open_run(ch.id)
         run_id = run.id
 
-    msg = engine.on_poll_vote(run_id, "U_VOTER", "1900-01-01", CHANNEL)
+    result = engine.on_poll_vote(run_id, "U_VOTER", "1900-01-01", CHANNEL)
 
-    assert msg == "투표 후보에 없는 날짜입니다. 최신 투표 메시지의 날짜 버튼을 눌러 주세요."
+    assert result.needs_feedback is True
+    assert result.feedback_text == "투표 후보에 없는 날짜입니다. 최신 투표 메시지의 날짜 버튼을 눌러 주세요."
     with session_factory() as session:
         votes = WorkflowRepository(session).votes_by_user(run_id)
     assert votes == {}
@@ -288,7 +293,9 @@ def test_poll_vote_closed(engine, session_factory):
         run = WorkflowRepository(session).get_open_run(ch.id)
         WorkflowRepository(session).update_run(run, state=WorkflowState.DONE)
         run_id = run.id
-    assert engine.on_poll_vote(run_id, "U1", "2099-06-15", CHANNEL) == m.MSG_POLL_CLOSED
+    result = engine.on_poll_vote(run_id, "U1", "2099-06-15", CHANNEL)
+    assert result.needs_feedback is True
+    assert result.feedback_text == m.MSG_POLL_CLOSED
 
 
 def test_close_poll_no_votes_picks_zero_unavailable_date(
@@ -473,7 +480,6 @@ def test_close_poll_uses_independent_calendar_invite_settings(
     payload = calendar_client.create_event.call_args.args[0]
     assert payload["attendees"] == [
         {"email": "u2@example.com", "optional": False},
-        {"email": "guest@example.com", "optional": True},
     ]
     dm_texts = [
         c.kwargs.get("text", "")

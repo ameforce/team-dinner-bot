@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -18,9 +19,8 @@ from app import messages as m
 from app.config import settings
 from app.db.models import init_db
 from app.db.repository import ChannelRepository, WorkflowRepository
-from app.handlers.intent import normalize_invocation_text
 from app.slack_invocation import USER_CMD
-from app.workflow.engine import WorkflowEngine
+from app.workflow.engine import PollVoteResult, WorkflowEngine
 from app.workflow.states import WorkflowState
 
 TEST_CHANNEL = os.getenv("TEAM_DINNER_BOT_TEST_CHANNEL_ID", "").strip()
@@ -65,21 +65,25 @@ def main(argv: list[str] | None = None) -> int:
         else:
             fail(f"G4 messages.{attr}", "missing")
 
-    cases = [
-        (USER_CMD, ""),
-        (f"{USER_CMD} status", "status"),
-        (f"/{USER_CMD} help", "help"),
-        (f" /{USER_CMD}", ""),
-        (f"<@BOT> {USER_CMD} \uc0c1\ud0dc", "\uc0c1\ud0dc"),
-        ("noise", None),
+    manifest = _load_manifest()
+    slash_commands = [
+        item.get("command")
+        for item in manifest.get("features", {}).get("slash_commands", [])
+        if isinstance(item, dict)
     ]
-    for raw, exp in cases:
-        normalized_raw = raw
-        got = normalize_invocation_text(normalized_raw)
-        if got == exp:
-            ok(f"A normalize {normalized_raw!r}")
-        else:
-            fail(f"A normalize {normalized_raw!r}", f"expected {exp!r}, got {got!r}")
+    bot_events = manifest.get("settings", {}).get("event_subscriptions", {}).get(
+        "bot_events", []
+    )
+    if f"/{USER_CMD}" in slash_commands:
+        ok(f"A slash command /{USER_CMD} present in manifest")
+    else:
+        fail("A slash command manifest", f"commands={slash_commands!r}")
+    legacy_events = {"message.channels", "message.groups", "app_mention"}
+    remaining_legacy = sorted(legacy_events.intersection(bot_events))
+    if not remaining_legacy:
+        ok("A legacy plain text events absent from manifest")
+    else:
+        fail("A legacy plain text events", f"still configured: {remaining_legacy!r}")
 
     app = App(token=settings.slack_bot_token, signing_secret=settings.slack_signing_secret)
     posted_messages: list[dict[str, Any]] = []
@@ -163,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             fail("D5 initial vote count", repr(votes))
 
     invalid_vote = engine.on_poll_vote(run_id, "U_TEST_VOTER", "1900-01-01", TEST_CHANNEL)
-    if invalid_vote == m.MSG_INVALID_POLL_OPTION:
+    if _poll_vote_feedback_matches(invalid_vote, m.MSG_INVALID_POLL_OPTION):
         ok("D5 invalid poll option rejected")
     else:
         fail("D5 invalid poll option", invalid_vote)
@@ -274,6 +278,16 @@ def _include_public_close(argv: list[str]) -> bool:
     enabled_values = {"1", "true", "yes", "on"}
     env_enabled = os.getenv("TEAM_DINNER_BOT_L2_INCLUDE_PUBLIC_CLOSE", "").strip().lower()
     return "--include-public-close" in argv or env_enabled in enabled_values
+
+
+def _load_manifest() -> dict:
+    return json.loads((ROOT / "slack-app-manifest.json").read_text(encoding="utf-8"))
+
+
+def _poll_vote_feedback_matches(result: object, expected_text: str) -> bool:
+    if isinstance(result, PollVoteResult):
+        return result.needs_feedback and result.feedback_text == expected_text
+    return result == expected_text
 
 
 if __name__ == "__main__":

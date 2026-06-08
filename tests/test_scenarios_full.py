@@ -9,10 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app import messages as m
-from app.handlers.intent import (
-    dispatch_hoesik_intent,
-    normalize_invocation_text,
-)
+from app.handlers.intent import dispatch_hoesik_intent
 from app.handlers.views import parse_settings_submission
 from app.schedule.spec import ScheduleSpec, ScheduleType
 from app.slack_invocation import USER_CMD
@@ -32,24 +29,38 @@ def _first_poll_date(client) -> str:
     raise AssertionError("poll button not found")
 
 
-# --- A: Natural language ---
+# --- A: Slash command invocation ---
 
 
 @pytest.mark.parametrize(
-    "raw,expected",
+    "sub_text,expected_prompt",
     [
-        (f"/{CMD}", ""),
-        (f" /{CMD}", ""),
-        (f"<@U0B4> {CMD} \ub3c4\uc6c0\ub9d0", "\ub3c4\uc6c0\ub9d0"),
-        (f"{CMD} \uc0c1\ud0dc", "\uc0c1\ud0dc"),
-        (f"{CMD} \uc77c\uc815", "\uc77c\uc815"),
-        ("random", None),
-        ("", None),
+        ("", True),
+        ("\ub3c4\uc6c0\ub9d0", False),
+        ("\uc0c1\ud0dc", True),
+        ("\uc77c\uc815", True),
+        ("random", True),
     ],
-    ids=["A3", "A4", "A5", "A7-ko", "A7-alt", "A14-noise", "A14-empty"],
+    ids=["A3-empty", "A5-help", "A7-status", "A7-alt-status", "A14-unknown"],
 )
-def test_normalize_scenarios(raw: str, expected: str | None):
-    assert normalize_invocation_text(raw.replace("U0B4", "U0BOT")) == expected
+def test_slash_dispatch_scenarios(sub_text: str, expected_prompt: bool, monkeypatch):
+    replies: list[str] = []
+    prompts: list[bool] = []
+    monkeypatch.setattr("app.handlers.intent.format_status", lambda *_args: "status ok")
+
+    dispatch_hoesik_intent(
+        sub_text=sub_text,
+        channel_id="C1",
+        user_id="U1",
+        session_factory=MagicMock(),
+        engine=MagicMock(),
+        job_scheduler=None,
+        reply=replies.append,
+        open_modal=None,
+        post_action_prompt=lambda: prompts.append(True),
+    )
+
+    assert bool(prompts) is expected_prompt
 
 
 def test_a8_unknown_subcommand():
@@ -121,34 +132,48 @@ def test_a13_google_code_argument_is_ignored_as_legacy_command():
     assert "\uc2e4\ud328" not in replies[0]
 
 
-def test_a14_bot_message_matcher_skips_mention():
-    from app.handlers.intent import register_natural_language_handlers
+def test_a14_no_plain_text_or_mention_invocation_handlers(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
 
-    captured: list = []
+    from app.db.models import Base
+    from app.handlers import events as ev_mod
+
+    db = tmp_path / "a14.db"
+    eng = create_engine(f"sqlite:///{db}", future=True)
+    Base.metadata.create_all(eng)
+    factory = sessionmaker(bind=eng)
 
     class FakeApp:
+        def __init__(self):
+            self.events: dict[str, object] = {}
+            self.messages: list[dict] = []
+
         def event(self, _name):
             def deco(fn):
-                captured.append(("event", fn))
+                self.events[_name] = fn
                 return fn
 
             return deco
 
         def message(self, **kwargs):
             def deco(fn):
-                captured.append(("message", kwargs, fn))
+                self.messages.append({"kwargs": kwargs, "fn": fn})
+                return fn
+
+            return deco
+
+        def action(self, _action_id):
+            def deco(fn):
                 return fn
 
             return deco
 
     app = FakeApp()
-    register_natural_language_handlers(app, MagicMock(), MagicMock())
-    _, kwargs, matcher_fn = [c for c in captured if c[0] == "message"][0]
-    assert kwargs["matchers"]
-    is_match = kwargs["matchers"][0]
-    assert not is_match({"bot_id": "B1", "text": CMD})
-    assert not is_match({"text": f"<@U0BOT> {CMD}"})
-    assert is_match({"text": CMD, "user": "U1"})
+    ev_mod.register_event_handlers(app, factory, engine=MagicMock())
+
+    assert "app_mention" not in app.events
+    assert app.messages == []
 
 
 # --- C: Modal ---
@@ -388,7 +413,9 @@ def test_b4_poll_closed_vote(engine_ctx):
         run = WorkflowRepository(session).get_open_run(row.id)
         WorkflowRepository(session).update_run(run, state=WorkflowState.DONE)
         run_id = run.id
-    assert engine.on_poll_vote(run_id, "U1", "2099-06-15", ch) == m.MSG_POLL_CLOSED
+    result = engine.on_poll_vote(run_id, "U1", "2099-06-15", ch)
+    assert result.needs_feedback is True
+    assert result.feedback_text == m.MSG_POLL_CLOSED
 
 
 def test_poll_blocks_max_five_per_row():
@@ -549,6 +576,25 @@ def test_f1_schedule_channel_adds_job(engine_ctx):
     sched.scheduler.get_jobs.return_value = []
     sched.schedule_channel(ch)
     sched.scheduler.add_job.assert_called_once()
+
+
+def test_f1_schedule_channel_skips_when_automatic_execution_off(engine_ctx):
+    factory, engine, _client, ch = engine_ctx
+    with factory() as session:
+        from app.db.repository import ChannelRepository
+
+        row = ChannelRepository(session).get_by_channel_id(ch)
+        row.automatic_execution_enabled = False
+        session.commit()
+    sched = __import__("app.scheduler.runner", fromlist=["JobScheduler"]).JobScheduler(
+        factory, engine
+    )
+    sched.scheduler = MagicMock()
+    sched.scheduler.get_jobs.return_value = []
+
+    sched.schedule_channel(ch)
+
+    sched.scheduler.add_job.assert_not_called()
 
 
 def test_f2_schedule_poll_close(engine_ctx):

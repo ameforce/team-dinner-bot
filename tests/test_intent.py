@@ -1,45 +1,37 @@
 # -*- coding: utf-8 -*-
-"""Natural-language invocation parsing and dispatch branches."""
+"""Slash command dispatch branches."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from app.db.models import Base, Channel
 from app.handlers.intent import (
     dispatch_hoesik_intent,
+    format_status,
     help_text,
-    normalize_invocation_text,
 )
+from app.schedule.spec import ScheduleSpec, ScheduleType
 from app.slack_invocation import USER_CMD
-
-CMD = USER_CMD  # \ud68c\uc2dd
-
-
-@pytest.mark.parametrize(
-    "raw,expected",
-    [
-        (CMD, ""),
-        (f"{CMD} status", "status"),
-        (f"/{CMD}", ""),
-        (f" /{CMD} help", "help"),
-        (f"<@U0BOT> {CMD}", ""),
-        (f"<@U0BOT> {CMD} \uc0c1\ud0dc", "\uc0c1\ud0dc"),
-        (f"<@U0BOT> {CMD} run-now", "run-now"),
-        ("hello", None),
-        ("", None),
-    ],
-)
-def test_normalize_invocation_text(raw: str, expected: str | None):
-    assert normalize_invocation_text(raw) == expected
-
 
 def test_help_text_contains_commands():
     text = help_text()
-    assert USER_CMD in text
+    assert f"/{USER_CMD}" in text
     assert "status" in text or "\uc0c1\ud0dc" in text
+    assert "@봇이름" not in text
+    assert f" /{USER_CMD}" not in text
     assert "OAuth" not in text
     assert "google-code" not in text
+
+
+def test_intent_module_exposes_no_natural_language_registration():
+    import app.handlers.intent as intent
+
+    assert not hasattr(intent, "normalize_invocation_text")
+    assert not hasattr(intent, "register_natural_language_handlers")
 
 
 def _dispatch(sub_text: str, *, admin_user_ids: str = "", user_id: str = "U1"):
@@ -134,29 +126,30 @@ def test_dispatch_status_subcommand_also_shows_action_panel(monkeypatch):
     assert prompts == [True]
 
 
-def test_message_matcher_skips_mention_text():
-    from app.handlers.intent import register_natural_language_handlers
+def test_format_status_reports_automatic_execution_off_without_next_run(tmp_path):
+    db = tmp_path / "status.db"
+    engine = create_engine(f"sqlite:///{db}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    spec = ScheduleSpec(type=ScheduleType.WEEKLY_WEEKDAY, weekday=1, hour=10, minute=0)
+    with factory() as session:
+        session.add(
+            Channel(
+                team_id="T1",
+                channel_id="C_STATUS",
+                enabled=True,
+                automatic_execution_enabled=False,
+                schedule_json=spec.model_dump_json(),
+                poll_duration_hours=48,
+                tz="Asia/Seoul",
+            )
+        )
+        session.commit()
 
-    items: list = []
+    text = format_status("C_STATUS", factory)
 
-    class FakeApp:
-        def event(self, _):
-            def d(fn):
-                return fn
-
-            return d
-
-        def message(self, **kw):
-            def d(fn):
-                items.append(kw["matchers"][0])
-                return fn
-
-            return d
-
-    register_natural_language_handlers(FakeApp(), MagicMock(), MagicMock())
-    matcher = items[0]
-    assert matcher({"text": f"<@UBOT> {CMD}", "user": "U1"}) is False
-    assert matcher({"text": CMD, "user": "U1"}) is True
+    assert "자동 실행: 사용 안 함" in text
+    assert "다음 실행:" not in text
 
 
 def test_dispatch_engine_error():
