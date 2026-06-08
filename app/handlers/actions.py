@@ -27,8 +27,9 @@ def register_action_handlers(app: App, session_factory: sessionmaker, engine: Wo
         except (AttributeError, IndexError, KeyError, TypeError, ValueError):
             _post_invalid_action(client, channel_id, user_id)
             return
-        msg = engine.on_poll_vote(run_id, user_id, date_iso, channel_id)
-        client.chat_postEphemeral(channel=channel_id, user=user_id, text=msg)
+        result = engine.on_poll_vote(run_id, user_id, date_iso, channel_id)
+        if result.needs_feedback and result.feedback_text:
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text=result.feedback_text)
 
     @app.action("booking_done")
     def on_booking_done(ack, body, client):

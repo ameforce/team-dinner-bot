@@ -18,8 +18,9 @@ def test_bot_name_comes_from_settings_default():
     assert m.BOT_NAME == settings.bot_display_name
 
 
-def test_help_text_uses_generic_mention_instruction():
+def test_help_text_uses_slash_command_instruction():
     text = help_text()
 
     assert ("@e" + "Yami") not in text
-    assert "@봇이름" in text
+    assert "/회식" in text
+    assert "@봇이름" not in text

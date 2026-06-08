@@ -14,7 +14,9 @@ from app.db.repository import ChannelRepository
 from app.handlers.actions import register_action_handlers
 from app.handlers.commands import register_command_handlers
 from app.handlers.events import register_event_handlers
+from app.handlers.views import encode_settings_metadata
 from app.schedule.spec import ScheduleSpec, ScheduleType
+from app.workflow.engine import PollVoteResult
 
 
 CHANNEL = "C_HANDLER_TEST"
@@ -23,6 +25,7 @@ CHANNEL = "C_HANDLER_TEST"
 class FakeApp:
     def __init__(self):
         self.actions: dict[str, object] = {}
+        self.commands: dict[str, object] = {}
         self.events: dict[str, object] = {}
         self.views: dict[str, object] = {}
         self.messages: list[dict] = []
@@ -37,6 +40,13 @@ class FakeApp:
     def event(self, name):
         def wrap(fn):
             self.events[name] = fn
+            return fn
+
+        return wrap
+
+    def command(self, name):
+        def wrap(fn):
+            self.commands[name] = fn
             return fn
 
         return wrap
@@ -84,17 +94,21 @@ def _settings_view(channel_id: str = CHANNEL) -> dict:
         "private_metadata": channel_id,
         "state": {
             "values": {
+                "automatic_execution": {
+                    "value": {"selected_option": {"value": "on"}}
+                },
                 "schedule_type": {
                     "value": {"selected_option": {"value": "MONTHLY_DAY_OF_MONTH"}}
                 },
                 "day_of_month": {"value": {"value": "15"}},
+                "month_interval": {"value": {"value": "2"}},
                 "poll_hour": {"value": {"value": "11"}},
                 "poll_duration": {"value": {"value": "36"}},
                 "booking_url": {"value": {"value": "https://example.com/new-book"}},
                 "poll_targets": {"value": {"selected_users": ["U1", "U2"]}},
                 "calendar_required": {"value": {"selected_users": ["U1"]}},
                 "calendar_required_emails": {"value": {"value": "guest@example.com"}},
-                "calendar_optional": {"value": {"selected_users": []}},
+                "calendar_optional": {"value": {"selected_users": ["U2"]}},
                 "calendar_excluded": {"value": {"selected_users": ["U2"]}},
             }
         },
@@ -135,16 +149,24 @@ def test_open_settings_action_opens_prefilled_modal(session_factory):
     view = client.views_update.call_args.kwargs["view"]
     assert view["private_metadata"] == CHANNEL
     assert view["callback_id"] == "settings_submit"
-    assert _block(view, "schedule_type")["element"]["initial_option"]["value"] == "WEEKLY_WEEKDAY"
-    assert _block(view, "weekday")["element"]["initial_option"]["value"] == "1"
+    assert _block(view, "legacy_weekly_notice")
+    assert _block(view, "schedule_type")["element"]["initial_option"]["value"] == "MONTHLY_DAY_OF_MONTH"
+    assert _block(view, "automatic_execution")["element"]["initial_option"]["value"] == "on"
+    assert "WEEKLY_WEEKDAY" not in [
+        option["value"] for option in _block(view, "schedule_type")["element"]["options"]
+    ]
+    assert _block(view, "day_of_month")["element"]["initial_value"] == "15"
     assert _block(view, "poll_hour")["element"]["initial_value"] == "10"
     assert _block(view, "poll_duration")["element"]["initial_value"] == "48"
     assert _block(view, "booking_url")["element"]["initial_value"] == "https://example.com/book"
     assert _block(view, "poll_targets")["element"]["initial_users"] == ["U1", "U2"]
     assert _block(view, "calendar_required")["element"]["initial_users"] == ["U1"]
-    assert _block(view, "calendar_optional_emails")["element"]["initial_value"] == "guest@example.com"
     assert "initial_users" not in _block(view, "calendar_optional")["element"]
-    assert _block(view, "calendar_excluded")["element"]["initial_users"] == ["U2"]
+    block_ids = {block.get("block_id") for block in view["blocks"]}
+    assert "calendar_required_emails" not in block_ids
+    assert "calendar_optional_emails" not in block_ids
+    assert "calendar_excluded" not in block_ids
+    assert "calendar_excluded_emails" not in block_ids
 
 
 def test_open_settings_uses_trigger_before_member_lookup(session_factory, monkeypatch):
@@ -200,7 +222,86 @@ def test_open_settings_defaults_unconfigured_participants_to_channel_members(ses
     assert _block(view, "poll_targets")["element"]["initial_users"] == ["U1", "U2"]
     assert _block(view, "calendar_required")["element"]["initial_users"] == ["U1", "U2"]
     assert "initial_users" not in _block(view, "calendar_optional")["element"]
-    assert "initial_users" not in _block(view, "calendar_excluded")["element"]
+    assert not any(block.get("block_id") == "calendar_excluded" for block in view["blocks"])
+
+
+def test_register_command_handlers_registers_hoesik_slash_command(session_factory):
+    app = FakeApp()
+
+    register_command_handlers(app, session_factory, engine=MagicMock())
+
+    assert "/회식" in app.commands
+
+
+def test_register_event_handlers_does_not_register_text_invocation_handlers(session_factory):
+    app = FakeApp()
+
+    register_event_handlers(app, session_factory, engine=MagicMock())
+
+    assert "app_mention" not in app.events
+    assert app.messages == []
+
+
+def test_hoesik_slash_command_posts_action_panel(session_factory):
+    app = FakeApp()
+    client = MagicMock()
+    ack = MagicMock()
+    register_command_handlers(app, session_factory, engine=MagicMock())
+
+    app.commands["/회식"](
+        ack,
+        {"channel_id": CHANNEL, "user_id": "U1", "text": "", "trigger_id": "TRIGGER1"},
+        client,
+        MagicMock(),
+    )
+
+    ack.assert_called_once()
+    client.chat_postMessage.assert_called_once()
+    kwargs = client.chat_postMessage.call_args.kwargs
+    assert kwargs["channel"] == CHANNEL
+    assert kwargs["text"] == m.MSG_SETTINGS_PROMPT
+    assert any(
+        el.get("action_id") == "open_settings"
+        for block in kwargs["blocks"]
+        if block["type"] == "actions"
+        for el in block["elements"]
+    )
+    client.views_open.assert_not_called()
+
+
+def test_hoesik_settings_slash_command_opens_settings_modal_directly(
+    session_factory, monkeypatch
+):
+    events = []
+    app = FakeApp()
+    client = MagicMock()
+    client.views_open.side_effect = lambda **_kwargs: events.append("views_open") or {
+        "view": {"id": "V_SETTINGS"}
+    }
+
+    def fake_member_lookup(_client, _channel_id):
+        events.append("member_lookup")
+        return ["U1"]
+
+    monkeypatch.setattr("app.handlers.commands.list_human_member_ids", fake_member_lookup)
+    ack = MagicMock()
+    register_command_handlers(app, session_factory, engine=MagicMock())
+
+    app.commands["/회식"](
+        ack,
+        {"channel_id": CHANNEL, "user_id": "U1", "text": "설정", "trigger_id": "TRIGGER1"},
+        client,
+        MagicMock(),
+    )
+
+    ack.assert_called_once()
+    assert events == ["views_open", "member_lookup"]
+    client.chat_postMessage.assert_not_called()
+    client.views_open.assert_called_once()
+    client.views_update.assert_called_once()
+    view = client.views_update.call_args.kwargs["view"]
+    assert view["callback_id"] == "settings_submit"
+    assert _block(view, "calendar_required")
 
 
 def test_show_status_action_posts_ephemeral_status(session_factory):
@@ -299,15 +400,502 @@ def test_settings_submit_saves_schedule_and_booking_url(session_factory):
         saved = json.loads(ch.schedule_json)
         assert saved["type"] == "MONTHLY_DAY_OF_MONTH"
         assert saved["day"] == 15
+        assert saved["month_interval"] == 2
+        assert ch.automatic_execution_enabled is True
         assert ch.poll_duration_hours == 36
         assert ch.booking_url_template == "https://example.com/new-book"
         assert json.loads(ch.poll_target_ids_json) == ["U1", "U2"]
         assert json.loads(ch.channel_member_ids_json) == ["U1", "U2"]
         assert json.loads(ch.calendar_invitees_json) == [
             {"kind": "slack", "role": "required", "value": "U1"},
-            {"kind": "email", "role": "required", "value": "guest@example.com"},
-            {"kind": "slack", "role": "excluded", "value": "U2"},
+            {"kind": "slack", "role": "optional", "value": "U2"},
         ]
+
+
+def test_settings_submit_sets_month_interval_anchor(session_factory, monkeypatch):
+    class FixedDateTime:
+        @classmethod
+        def now(cls, _tz):
+            from datetime import datetime
+
+            return datetime(2026, 5, 20, 12, 0, tzinfo=_tz)
+
+    monkeypatch.setattr("app.db.repository.datetime", FixedDateTime)
+    app = FakeApp()
+    client = MagicMock()
+    client.conversations_members.return_value = {"members": ["U1", "U2"]}
+    client.users_info.side_effect = lambda user: {
+        "user": {
+            "id": user,
+            "is_bot": False,
+            "deleted": False,
+            "profile": {"display_name": user},
+        }
+    }
+    ack = MagicMock()
+    register_command_handlers(app, session_factory, engine=MagicMock(), job_scheduler=MagicMock())
+
+    app.views["settings_submit"](ack, {}, client, _settings_view())
+
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        saved = json.loads(ch.schedule_json)
+        assert saved["month_anchor_year"] == 2026
+        assert saved["month_anchor_month"] == 5
+
+
+def test_settings_submit_preserves_month_interval_anchor_when_only_time_changes(
+    session_factory,
+    monkeypatch,
+):
+    class LaterDateTime:
+        @classmethod
+        def now(cls, _tz):
+            from datetime import datetime
+
+            return datetime(2026, 6, 1, 12, 0, tzinfo=_tz)
+
+    spec = ScheduleSpec(
+        type=ScheduleType.MONTHLY_DAY_OF_MONTH,
+        day=15,
+        month_interval=2,
+        month_anchor_year=2026,
+        month_anchor_month=5,
+        hour=10,
+        minute=0,
+    )
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        ch.schedule_json = spec.model_dump_json()
+        session.commit()
+    monkeypatch.setattr("app.db.repository.datetime", LaterDateTime)
+    app = FakeApp()
+    client = MagicMock()
+    client.conversations_members.return_value = {"members": ["U1", "U2"]}
+    client.users_info.side_effect = lambda user: {
+        "user": {
+            "id": user,
+            "is_bot": False,
+            "deleted": False,
+            "profile": {"display_name": user},
+        }
+    }
+    ack = MagicMock()
+    view = _settings_view()
+    view["state"]["values"]["poll_hour"]["value"]["value"] = "14"
+    register_command_handlers(app, session_factory, engine=MagicMock(), job_scheduler=MagicMock())
+
+    app.views["settings_submit"](ack, {}, client, view)
+
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        saved = json.loads(ch.schedule_json)
+        assert saved["hour"] == 14
+        assert saved["month_anchor_year"] == 2026
+        assert saved["month_anchor_month"] == 5
+
+
+def test_settings_submit_saves_automatic_execution_off(session_factory):
+    app = FakeApp()
+    client = MagicMock()
+    client.conversations_members.return_value = {"members": ["U1", "U2"]}
+    client.users_info.side_effect = lambda user: {
+        "user": {
+            "id": user,
+            "is_bot": False,
+            "deleted": False,
+            "profile": {"display_name": user},
+        }
+    }
+    ack = MagicMock()
+    scheduler = MagicMock()
+    register_command_handlers(app, session_factory, engine=MagicMock(), job_scheduler=scheduler)
+    view = _settings_view()
+    view["state"]["values"]["automatic_execution"]["value"]["selected_option"]["value"] = "off"
+
+    app.views["settings_submit"](ack, {}, client, view)
+
+    ack.assert_called_once()
+    scheduler.schedule_channel.assert_called_once_with(CHANNEL)
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        assert ch.enabled is True
+        assert ch.automatic_execution_enabled is False
+
+
+def test_settings_submit_auto_off_without_schedule_fields_preserves_existing_schedule(session_factory):
+    app = FakeApp()
+    client = MagicMock()
+    client.conversations_members.return_value = {"members": ["U1", "U2"]}
+    client.users_info.side_effect = lambda user: {
+        "user": {
+            "id": user,
+            "is_bot": False,
+            "deleted": False,
+            "profile": {"display_name": user},
+        }
+    }
+    ack = MagicMock()
+    scheduler = MagicMock()
+    register_command_handlers(app, session_factory, engine=MagicMock(), job_scheduler=scheduler)
+    view = _settings_view()
+    view["state"]["values"]["automatic_execution"]["value"]["selected_option"]["value"] = "off"
+    for block_id in ("schedule_type", "day_of_month", "month_interval", "poll_hour"):
+        view["state"]["values"].pop(block_id)
+
+    app.views["settings_submit"](ack, {}, client, view)
+
+    ack.assert_called_once()
+    client.chat_postMessage.assert_called_once()
+    scheduler.schedule_channel.assert_called_once_with(CHANNEL)
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        saved = json.loads(ch.schedule_json)
+        assert saved["type"] == "WEEKLY_WEEKDAY"
+        assert ch.automatic_execution_enabled is False
+
+
+def test_settings_submit_auto_off_without_schedule_fields_uses_metadata_draft(session_factory):
+    app = FakeApp()
+    client = MagicMock()
+    client.conversations_members.return_value = {"members": ["U1", "U2"]}
+    client.users_info.side_effect = lambda user: {
+        "user": {
+            "id": user,
+            "is_bot": False,
+            "deleted": False,
+            "profile": {"display_name": user},
+        }
+    }
+    ack = MagicMock()
+    scheduler = MagicMock()
+    register_command_handlers(app, session_factory, engine=MagicMock(), job_scheduler=scheduler)
+    view = _settings_view()
+    view["private_metadata"] = encode_settings_metadata(
+        CHANNEL,
+        {
+            "type": "MONTHLY_NTH_WEEKDAY",
+            "weekday": "4",
+            "nth": "-1",
+            "month_interval": "3",
+            "hour": "16",
+        },
+    )
+    view["state"]["values"]["automatic_execution"]["value"]["selected_option"]["value"] = "off"
+    for block_id in ("schedule_type", "day_of_month", "month_interval", "poll_hour"):
+        view["state"]["values"].pop(block_id)
+
+    app.views["settings_submit"](ack, {}, client, view)
+
+    ack.assert_called_once()
+    client.chat_postMessage.assert_called_once()
+    scheduler.schedule_channel.assert_called_once_with(CHANNEL)
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        saved = json.loads(ch.schedule_json)
+        assert saved["type"] == "MONTHLY_NTH_WEEKDAY"
+        assert saved["weekday"] == 4
+        assert saved["nth"] == -1
+        assert saved["month_interval"] == 3
+        assert saved["hour"] == 16
+        assert ch.automatic_execution_enabled is False
+
+
+def test_automatic_execution_change_hides_schedule_controls_immediately(session_factory):
+    app = FakeApp()
+    client = MagicMock()
+    ack = MagicMock()
+    register_event_handlers(app, session_factory, engine=MagicMock())
+
+    app.actions["value"](
+        ack,
+        {
+            "view": {
+                "id": "V_SETTINGS",
+                "hash": "h_auto",
+                "private_metadata": CHANNEL,
+                "state": {
+                    "values": {
+                        "automatic_execution": {
+                            "value": {"selected_option": {"value": "off"}}
+                        },
+                        "schedule_type": {
+                            "value": {
+                                "selected_option": {"value": "MONTHLY_DAY_OF_MONTH"}
+                            }
+                        },
+                        "day_of_month": {"value": {"value": "20"}},
+                        "month_interval": {"value": {"value": "3"}},
+                        "poll_hour": {"value": {"value": "14"}},
+                        "poll_duration": {"value": {"value": "48"}},
+                    }
+                },
+            },
+            "actions": [
+                {
+                    "block_id": "automatic_execution",
+                    "action_id": "value",
+                    "selected_option": {"value": "off"},
+                }
+            ],
+        },
+        client,
+    )
+
+    ack.assert_called_once()
+    view = client.views_update.call_args.kwargs["view"]
+    assert _block(view, "automatic_execution")["element"]["initial_option"]["value"] == "off"
+    assert not any(block.get("block_id") == "schedule_type" for block in view["blocks"])
+    assert not any(block.get("block_id") == "day_of_month" for block in view["blocks"])
+    assert not any(block.get("block_id") == "month_interval" for block in view["blocks"])
+    assert not any(block.get("block_id") == "poll_hour" for block in view["blocks"])
+    assert _block(view, "poll_duration")["element"]["initial_value"] == "48"
+
+
+def test_automatic_execution_change_from_off_preserves_non_schedule_inputs(session_factory):
+    app = FakeApp()
+    client = MagicMock()
+    ack = MagicMock()
+    register_event_handlers(app, session_factory, engine=MagicMock())
+
+    app.actions["value"](
+        ack,
+        {
+            "view": {
+                "id": "V_SETTINGS",
+                "hash": "h_auto",
+                "private_metadata": CHANNEL,
+                "state": {
+                    "values": {
+                        "automatic_execution": {
+                            "value": {"selected_option": {"value": "on"}}
+                        },
+                        "poll_duration": {"value": {"value": "72"}},
+                        "booking_url": {"value": {"value": "https://example.com/book"}},
+                    }
+                },
+            },
+            "actions": [
+                {
+                    "block_id": "automatic_execution",
+                    "action_id": "value",
+                    "selected_option": {"value": "on"},
+                }
+            ],
+        },
+        client,
+    )
+
+    ack.assert_called_once()
+    view = client.views_update.call_args.kwargs["view"]
+    assert _block(view, "automatic_execution")["element"]["initial_option"]["value"] == "on"
+    assert any(block.get("block_id") == "schedule_type" for block in view["blocks"])
+    assert _block(view, "poll_duration")["element"]["initial_value"] == "72"
+    assert _block(view, "booking_url")["element"]["initial_value"] == "https://example.com/book"
+
+
+def test_automatic_execution_change_from_off_restores_persisted_schedule(session_factory):
+    with session_factory() as session:
+        ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
+        ch.automatic_execution_enabled = False
+        ch.schedule_json = ScheduleSpec(
+            type=ScheduleType.MONTHLY_NTH_WEEKDAY,
+            weekday=4,
+            nth=-1,
+            month_interval=3,
+            hour=16,
+            minute=0,
+        ).model_dump_json()
+        session.commit()
+    app = FakeApp()
+    client = MagicMock()
+    client.views_open.return_value = {"view": {"id": "V_SETTINGS"}}
+    ack = MagicMock()
+    register_event_handlers(app, session_factory, engine=MagicMock())
+
+    app.actions["open_settings"](
+        MagicMock(),
+        {"channel": {"id": CHANNEL}, "trigger_id": "TRIGGER1"},
+        client,
+    )
+    opened_view = client.views_update.call_args.kwargs["view"]
+    assert not any(block.get("block_id") == "schedule_type" for block in opened_view["blocks"])
+
+    app.actions["value"](
+        ack,
+        {
+            "view": {
+                "id": "V_SETTINGS",
+                "hash": "h_auto",
+                "private_metadata": opened_view["private_metadata"],
+                "state": {
+                    "values": {
+                        "automatic_execution": {
+                            "value": {"selected_option": {"value": "on"}}
+                        },
+                        "poll_duration": {"value": {"value": "48"}},
+                        "booking_url": {"value": {"value": "https://example.com/book"}},
+                    }
+                },
+            },
+            "actions": [
+                {
+                    "block_id": "automatic_execution",
+                    "action_id": "value",
+                    "selected_option": {"value": "on"},
+                }
+            ],
+        },
+        client,
+    )
+
+    ack.assert_called_once()
+    view = client.views_update.call_args.kwargs["view"]
+    assert _block(view, "schedule_type")["element"]["initial_option"]["value"] == "MONTHLY_NTH_WEEKDAY"
+    assert _block(view, "month_interval")["element"]["initial_value"] == "3"
+    assert _block(view, "nth")["element"]["initial_value"] == "-1"
+    assert _block(view, "weekday")["element"]["initial_option"]["value"] == "4"
+    assert _block(view, "poll_hour")["element"]["initial_value"] == "16"
+
+
+def test_schedule_type_change_updates_settings_modal_fields(session_factory):
+    app = FakeApp()
+    client = MagicMock()
+    ack = MagicMock()
+    register_event_handlers(app, session_factory, engine=MagicMock())
+
+    app.actions["value"](
+        ack,
+        {
+            "view": {
+                "id": "V_SETTINGS",
+                "hash": "h1",
+                "private_metadata": CHANNEL,
+                "state": {
+                    "values": {
+                        "automatic_execution": {
+                            "value": {"selected_option": {"value": "on"}}
+                        },
+                        "schedule_type": {
+                            "value": {
+                                "selected_option": {"value": "MONTHLY_NTH_WEEKDAY"}
+                            }
+                        },
+                        "weekday": {"value": {"selected_option": {"value": "1"}}},
+                        "poll_hour": {"value": {"value": "14"}},
+                        "poll_duration": {"value": {"value": "48"}},
+                    }
+                },
+            },
+            "actions": [
+                {
+                    "block_id": "schedule_type",
+                    "action_id": "value",
+                    "selected_option": {"value": "MONTHLY_NTH_WEEKDAY"},
+                }
+            ],
+        },
+        client,
+    )
+
+    ack.assert_called_once()
+    updated = client.views_update.call_args.kwargs
+    assert updated["view_id"] == "V_SETTINGS"
+    assert updated["hash"] == "h1"
+    view = updated["view"]
+    assert _block(view, "schedule_type")["element"]["initial_option"]["value"] == "MONTHLY_NTH_WEEKDAY"
+    assert _block(view, "weekday")["element"]["initial_option"]["value"] == "1"
+    assert _block(view, "nth")["element"]["initial_value"] == "2"
+    assert _block(view, "month_interval")["element"]["initial_value"] == "1"
+    assert not any(block.get("block_id") == "day_of_month" for block in view["blocks"])
+
+
+def test_schedule_type_change_preserves_hidden_monthly_day_draft(session_factory):
+    app = FakeApp()
+    client = MagicMock()
+    register_event_handlers(app, session_factory, engine=MagicMock())
+
+    app.actions["value"](
+        MagicMock(),
+        {
+            "view": {
+                "id": "V_SETTINGS",
+                "hash": "h1",
+                "private_metadata": CHANNEL,
+                "state": {
+                    "values": {
+                        "automatic_execution": {
+                            "value": {"selected_option": {"value": "on"}}
+                        },
+                        "schedule_type": {
+                            "value": {
+                                "selected_option": {"value": "MONTHLY_NTH_WEEKDAY"}
+                            }
+                        },
+                        "day_of_month": {"value": {"value": "20"}},
+                        "month_interval": {"value": {"value": "3"}},
+                        "poll_hour": {"value": {"value": "14"}},
+                        "poll_duration": {"value": {"value": "48"}},
+                    }
+                },
+            },
+            "actions": [
+                {
+                    "block_id": "schedule_type",
+                    "action_id": "value",
+                    "selected_option": {"value": "MONTHLY_NTH_WEEKDAY"},
+                }
+            ],
+        },
+        client,
+    )
+    first_view = client.views_update.call_args.kwargs["view"]
+    assert not any(block.get("block_id") == "day_of_month" for block in first_view["blocks"])
+    assert _block(first_view, "poll_hour")["element"]["initial_value"] == "14"
+    assert first_view["private_metadata"] != CHANNEL
+
+    client.reset_mock()
+    app.actions["value"](
+        MagicMock(),
+        {
+            "view": {
+                "id": "V_SETTINGS",
+                "hash": "h2",
+                "private_metadata": first_view["private_metadata"],
+                "state": {
+                    "values": {
+                        "automatic_execution": {
+                            "value": {"selected_option": {"value": "on"}}
+                        },
+                        "schedule_type": {
+                            "value": {
+                                "selected_option": {"value": "MONTHLY_DAY_OF_MONTH"}
+                            }
+                        },
+                        "weekday": {"value": {"selected_option": {"value": "1"}}},
+                        "nth": {"value": {"value": "2"}},
+                        "month_interval": {"value": {"value": "3"}},
+                        "poll_hour": {"value": {"value": "14"}},
+                        "poll_duration": {"value": {"value": "48"}},
+                    }
+                },
+            },
+            "actions": [
+                {
+                    "block_id": "schedule_type",
+                    "action_id": "value",
+                    "selected_option": {"value": "MONTHLY_DAY_OF_MONTH"},
+                }
+            ],
+        },
+        client,
+    )
+
+    second_view = client.views_update.call_args.kwargs["view"]
+    assert _block(second_view, "day_of_month")["element"]["initial_value"] == "20"
+    assert _block(second_view, "month_interval")["element"]["initial_value"] == "3"
+    assert _block(second_view, "poll_hour")["element"]["initial_value"] == "14"
+    assert not any(block.get("block_id") == "nth" for block in second_view["blocks"])
 
 
 def test_settings_submit_can_clear_booking_url(session_factory):
@@ -478,10 +1066,10 @@ def test_upsert_on_bot_join_repairs_blank_team_id(session_factory):
         assert row.team_id == "T_REAL"
 
 
-def test_poll_vote_action_calls_engine_and_posts_ephemeral():
+def test_poll_vote_action_success_does_not_post_ephemeral():
     app = FakeApp()
     engine = MagicMock()
-    engine.on_poll_vote.return_value = "vote ok"
+    engine.on_poll_vote.return_value = PollVoteResult.success(added=True)
     client = MagicMock()
     ack = MagicMock()
     register_action_handlers(app, MagicMock(), engine)
@@ -499,7 +1087,35 @@ def test_poll_vote_action_calls_engine_and_posts_ephemeral():
 
     ack.assert_called_once()
     engine.on_poll_vote.assert_called_once_with(42, "U1", "2099-06-20", CHANNEL)
-    client.chat_postEphemeral.assert_called_once_with(channel=CHANNEL, user="U1", text="vote ok")
+    client.chat_postEphemeral.assert_not_called()
+
+
+def test_poll_vote_action_closed_posts_ephemeral_feedback():
+    app = FakeApp()
+    engine = MagicMock()
+    engine.on_poll_vote.return_value = PollVoteResult.feedback(m.MSG_POLL_CLOSED)
+    client = MagicMock()
+    ack = MagicMock()
+    register_action_handlers(app, MagicMock(), engine)
+
+    action_key = next(key for key in app.actions if hasattr(key, "match"))
+    app.actions[action_key](
+        ack,
+        {
+            "actions": [{"value": "42:2099-06-20"}],
+            "user": {"id": "U1"},
+            "channel": {"id": CHANNEL},
+        },
+        client,
+    )
+
+    ack.assert_called_once()
+    engine.on_poll_vote.assert_called_once_with(42, "U1", "2099-06-20", CHANNEL)
+    client.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL,
+        user="U1",
+        text=m.MSG_POLL_CLOSED,
+    )
 
 
 def test_poll_vote_action_malformed_value_posts_invalid_and_skips_engine():

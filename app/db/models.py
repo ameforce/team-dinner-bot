@@ -24,6 +24,7 @@ class Channel(Base):
     team_id: Mapped[str] = mapped_column(String(32), index=True)
     channel_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    automatic_execution_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     schedule_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     poll_duration_hours: Mapped[int] = mapped_column(Integer, default=24)
     tz: Mapped[str] = mapped_column(String(64), default=_default_timezone)
@@ -100,12 +101,18 @@ def _migrate_existing_sqlite(engine) -> None:
         channel_rows = conn.execute(text("PRAGMA table_info(channels)")).mappings().all()
         channel_columns = {row["name"] for row in channel_rows}
         for column in (
+            "automatic_execution_enabled",
             "poll_target_ids_json",
             "calendar_invitees_json",
             "channel_member_ids_json",
         ):
             if column not in channel_columns:
-                conn.execute(text(f"ALTER TABLE channels ADD COLUMN {column} TEXT"))
+                if column == "automatic_execution_enabled":
+                    conn.execute(
+                        text("ALTER TABLE channels ADD COLUMN automatic_execution_enabled BOOLEAN DEFAULT 1")
+                    )
+                else:
+                    conn.execute(text(f"ALTER TABLE channels ADD COLUMN {column} TEXT"))
 
         rows = conn.execute(text("PRAGMA table_info(workflow_runs)")).mappings().all()
         columns = {row["name"] for row in rows}

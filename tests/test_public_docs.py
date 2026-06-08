@@ -12,7 +12,7 @@ PUBLIC_DOCS = (
     "SETUP.md",
     "docs/PUBLISH_CHECKLIST.md",
     "docs/SLACK_EVENT_SETUP.md",
-    "docs/REMOVE_SLASH_COMMAND.md",
+    "docs/SLASH_COMMAND_SETUP.md",
     "docs/TEST_RESULTS.md",
     "docs/TEST_SCENARIOS.md",
     "docs/TEST_PLAN_FULL.md",

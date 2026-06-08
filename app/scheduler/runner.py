@@ -97,7 +97,12 @@ class JobScheduler:
 
         with self.session_factory() as session:
             ch = ChannelRepository(session).get_by_channel_id(slack_channel_id)
-            if not ch or not ch.schedule_json or not ch.enabled:
+            if (
+                not ch
+                or not ch.schedule_json
+                or not ch.enabled
+                or not ch.automatic_execution_enabled
+            ):
                 return
             spec = ScheduleSpec.model_validate_json(ch.schedule_json)
             tz = ZoneInfo(ch.tz)

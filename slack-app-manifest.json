@@ -12,16 +12,22 @@
             "home_tab_enabled": false,
             "messages_tab_enabled": true,
             "messages_tab_read_only_enabled": false
-        }
+        },
+        "slash_commands": [
+            {
+                "command": "/회식",
+                "description": "회식 일정 설정, 상태 확인, 투표 실행",
+                "usage_hint": "[설정|상태|지금|취소]",
+                "should_escape": false
+            }
+        ]
     },
     "oauth_config": {
         "scopes": {
             "bot": [
-                "app_mentions:read",
                 "chat:write",
-                "channels:history",
                 "channels:read",
-                "groups:history",
+                "commands",
                 "groups:read",
                 "im:write",
                 "users:read",
@@ -34,10 +40,7 @@
         "event_subscriptions": {
             "bot_events": [
                 "member_joined_channel",
-                "member_left_channel",
-                "message.channels",
-                "message.groups",
-                "app_mention"
+                "member_left_channel"
             ]
         },
         "interactivity": {

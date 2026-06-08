@@ -1,31 +1,33 @@
-# Slack Event Setup
+# Slack App Setup
 
 Use `slack-app-manifest.json` as the starting point for a new Slack app in your
 own workspace.
 
-## 1. Event Subscriptions
+## 1. Slash Command
+
+1. Open `https://api.slack.com/apps/<APP_ID>/slash-commands`.
+2. Create `/회식`.
+3. Leave the request URL empty when Socket Mode is enabled.
+4. Use `회식 일정 설정, 상태 확인, 투표 실행` as the description.
+
+## 2. Event Subscriptions
 
 1. Open `https://api.slack.com/apps/<APP_ID>/event-subscriptions`.
 2. Turn **Enable Events** on.
 3. Subscribe to these bot events:
-   - `message.channels`
-   - `message.groups`
-   - `app_mention`
    - `member_joined_channel`
    - `member_left_channel`
 4. Save changes.
 
 Socket Mode does not require a public request URL.
 
-## 2. OAuth Scopes
+## 3. OAuth Scopes
 
 In **OAuth & Permissions -> Scopes -> Bot Token Scopes**, include:
 
-- `app_mentions:read`
 - `chat:write`
-- `channels:history`
 - `channels:read`
-- `groups:history`
+- `commands`
 - `groups:read`
 - `im:write`
 - `users:read`
@@ -33,7 +35,7 @@ In **OAuth & Permissions -> Scopes -> Bot Token Scopes**, include:
 
 Reinstall the app to your workspace after changing scopes.
 
-## 3. Invite The Bot
+## 4. Invite The Bot
 
 Invite your bot to a private test channel:
 
@@ -41,11 +43,11 @@ Invite your bot to a private test channel:
 /invite @Team Dinner Bot
 ```
 
-## 4. Run Locally
+## 5. Run Locally
 
 ```powershell
 cd <repo>
 python -m app.main
 ```
 
-Type `회식` or mention your bot with `회식` in your private test channel.
+Run `/회식` or `/회식 설정` in your private test channel.

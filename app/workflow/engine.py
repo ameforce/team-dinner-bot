@@ -5,6 +5,7 @@ import json
 import logging
 import random
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -46,6 +47,21 @@ from app.workflow.states import WorkflowState
 
 logger = logging.getLogger(__name__)
 SELECTION_AUDIT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class PollVoteResult:
+    needs_feedback: bool
+    feedback_text: str | None = None
+    added: bool | None = None
+
+    @classmethod
+    def success(cls, *, added: bool) -> "PollVoteResult":
+        return cls(needs_feedback=False, added=added)
+
+    @classmethod
+    def feedback(cls, text: str) -> "PollVoteResult":
+        return cls(needs_feedback=True, feedback_text=text)
 
 
 def _candidate_date_isos(run, ch: Channel) -> set[str]:
@@ -209,15 +225,15 @@ class WorkflowEngine:
         )
         return m.MSG_RUN_CANCELLED
 
-    def on_poll_vote(self, run_id: int, user_id: str, date_iso: str, channel_id: str) -> str:
+    def on_poll_vote(self, run_id: int, user_id: str, date_iso: str, channel_id: str) -> PollVoteResult:
         with self.session_factory() as session:
             wf = WorkflowRepository(session)
             run = wf.get_run(run_id)
             if not run or run.state != WorkflowState.POLL_OPEN:
-                return m.MSG_POLL_CLOSED
+                return PollVoteResult.feedback(m.MSG_POLL_CLOSED)
             ch = session.get(Channel, run.channel_id)
             if not ch or date_iso not in _candidate_date_isos(run, ch):
-                return m.MSG_INVALID_POLL_OPTION
+                return PollVoteResult.feedback(m.MSG_INVALID_POLL_OPTION)
             added = wf.toggle_vote(run_id, user_id, date_iso)
             votes = wf.votes_by_user(run_id)
             candidates = _candidate_dates(run, ch)
@@ -236,9 +252,7 @@ class WorkflowEngine:
                     unavailable_by_user=votes,
                 ),
             )
-        if added:
-            return m.MSG_POLL_VOTE_ADDED.format(date=date_iso)
-        return m.MSG_POLL_VOTE_REMOVED.format(date=date_iso)
+        return PollVoteResult.success(added=added)
 
     def close_poll(self, run_id: int) -> None:
         if self._cancel_poll_close:
@@ -331,24 +345,12 @@ class WorkflowEngine:
                 for invitee in calendar_invitees
                 if invitee.kind == "slack" and invitee.role == "optional"
             ]
-            required_external_emails = [
-                invitee.value
-                for invitee in calendar_invitees
-                if invitee.kind == "email" and invitee.role == "required"
-            ]
-            optional_external_emails = [
-                invitee.value
-                for invitee in calendar_invitees
-                if invitee.kind == "email" and invitee.role == "optional"
-            ]
             emails, missing_member_ids = collect_attendee_emails(
                 session, self.client, required_slack_ids
             )
             optional_emails, optional_missing_member_ids = collect_attendee_emails(
                 session, self.client, optional_slack_ids
             )
-            emails.extend(required_external_emails)
-            optional_emails.extend(optional_external_emails)
             missing_member_ids.extend(optional_missing_member_ids)
             last = wf.last_assignee(ch.id)
             pool = [u for u in members if u != last] or members

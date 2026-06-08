@@ -52,10 +52,11 @@ def resolve_calendar_invitees(
     resolved: list[CalendarInvitee] = []
     configured_slack_ids: set[str] = set()
     for invitee in configured_invitees:
-        if invitee.kind == "slack":
-            configured_slack_ids.add(invitee.value)
-            if invitee.value in known and invitee.value not in current:
-                continue
+        if invitee.kind != "slack" or invitee.role not in {"required", "optional"}:
+            continue
+        configured_slack_ids.add(invitee.value)
+        if invitee.value in known and invitee.value not in current:
+            continue
         resolved.append(invitee)
     for user_id in current_member_ids:
         if user_id not in known and user_id not in configured_slack_ids:
@@ -84,6 +85,7 @@ def invitees_to_json(invitees: list[CalendarInvitee]) -> str:
         [
             {"kind": invitee.kind, "role": invitee.role, "value": invitee.value}
             for invitee in invitees
+            if invitee.kind == "slack" and invitee.role in {"required", "optional"}
         ],
         ensure_ascii=False,
     )
