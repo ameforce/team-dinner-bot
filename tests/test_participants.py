@@ -18,7 +18,7 @@ def test_poll_targets_preserve_existing_settings_and_include_only_new_members_by
     assert targets == ["U1", "U3"]
 
 
-def test_calendar_invitees_preserve_roles_and_default_new_members_to_required():
+def test_calendar_invitees_keep_only_required_optional_slack_and_default_new_members():
     invitees = resolve_calendar_invitees(
         configured_invitees=[
             CalendarInvitee(value="U1", role="required", kind="slack"),
@@ -31,7 +31,5 @@ def test_calendar_invitees_preserve_roles_and_default_new_members_to_required():
 
     assert invitees == [
         CalendarInvitee(value="U1", role="required", kind="slack"),
-        CalendarInvitee(value="U2", role="excluded", kind="slack"),
-        CalendarInvitee(value="partner@example.com", role="optional", kind="email"),
         CalendarInvitee(value="U3", role="required", kind="slack"),
     ]

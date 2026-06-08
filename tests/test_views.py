@@ -3,7 +3,7 @@ import pytest
 
 from app.handlers.views import (
     MAX_BOOKING_URL_LENGTH,
-    MAX_EMAIL_LENGTH,
+    parse_automatic_execution_enabled,
     parse_participant_settings_submission,
     parse_settings_submission,
     settings_modal,
@@ -11,7 +11,7 @@ from app.handlers.views import (
     welcome_blocks,
 )
 from app.workflow.participants import CalendarInvitee
-from app.schedule.spec import ScheduleType
+from app.schedule.spec import ScheduleSpec, ScheduleType
 from app.settings_defaults import DEFAULT_POLL_DURATION_HOURS, MIN_POLL_DURATION_HOURS
 
 
@@ -38,6 +38,209 @@ def test_parse_weekly_settings():
     assert spec.weekday == 1
     assert spec.hour == 14
     assert hours == 24
+
+
+def test_parse_monthly_day_settings_accepts_hidden_weekday_and_month_interval():
+    spec, hours, _url = parse_settings_submission(
+        _view_payload(
+            schedule_type={
+                "value": {"selected_option": {"value": "MONTHLY_DAY_OF_MONTH"}}
+            },
+            weekday={},
+            day_of_month={"value": {"value": "15"}},
+            month_interval={"value": {"value": "2"}},
+        )
+    )
+
+    assert spec.type == ScheduleType.MONTHLY_DAY_OF_MONTH
+    assert spec.day == 15
+    assert spec.weekday is None
+    assert spec.month_interval == 2
+    assert hours == 24
+
+
+def test_parse_automatic_execution_enabled_defaults_on_and_accepts_off():
+    assert parse_automatic_execution_enabled(_view_payload()) is True
+
+    view = _view_payload(
+        automatic_execution={
+            "value": {"selected_option": {"value": "off"}},
+        }
+    )
+
+    assert parse_automatic_execution_enabled(view) is False
+
+
+def _block_ids(view: dict) -> set[str]:
+    return {block["block_id"] for block in view["blocks"] if "block_id" in block}
+
+
+def _block_order(view: dict) -> list[str]:
+    return [block["block_id"] for block in view["blocks"] if "block_id" in block]
+
+
+def _block(view: dict, block_id: str) -> dict:
+    return next(block for block in view["blocks"] if block.get("block_id") == block_id)
+
+
+def test_settings_modal_auto_execution_off_hides_schedule_controls():
+    view = settings_modal(
+        "C1",
+        spec=ScheduleSpec(
+            type=ScheduleType.MONTHLY_DAY_OF_MONTH,
+            day=15,
+            month_interval=2,
+            hour=10,
+            minute=0,
+        ),
+        automatic_enabled=False,
+    )
+
+    ids = _block_ids(view)
+    assert "automatic_execution" in ids
+    assert "schedule_type" not in ids
+    assert "weekday" not in ids
+    assert "day_of_month" not in ids
+    assert "nth" not in ids
+    assert "month_interval" not in ids
+    assert "poll_hour" not in ids
+    assert "poll_duration" in ids
+    assert "booking_url" in ids
+    assert "poll_targets" in ids
+    assert _block(view, "automatic_execution")["dispatch_action"] is True
+
+
+def test_settings_modal_schedule_type_options_exclude_weekly():
+    view = settings_modal("C1")
+
+    options = _block(view, "schedule_type")["element"]["options"]
+    assert [option["value"] for option in options] == [
+        "MONTHLY_DAY_OF_MONTH",
+        "MONTHLY_NTH_WEEKDAY",
+    ]
+
+
+def test_settings_modal_legacy_weekly_shows_notice_and_monthly_fallback():
+    view = settings_modal(
+        "C1",
+        spec=ScheduleSpec(
+            type=ScheduleType.WEEKLY_WEEKDAY,
+            weekday=1,
+            hour=10,
+            minute=0,
+        ),
+    )
+
+    ids = _block_ids(view)
+    assert "legacy_weekly_notice" in ids
+    assert "month_interval" in ids
+    assert "day_of_month" in ids
+    assert "weekday" not in ids
+    assert "nth" not in ids
+    schedule_block = _block(view, "schedule_type")
+    assert schedule_block["dispatch_action"] is True
+    assert schedule_block["element"]["initial_option"]["value"] == "MONTHLY_DAY_OF_MONTH"
+    assert "WEEKLY_WEEKDAY" not in [option["value"] for option in schedule_block["element"]["options"]]
+
+
+def test_settings_modal_draft_metadata_is_versioned():
+    view = settings_modal(
+        "C1",
+        spec=ScheduleSpec(
+            type=ScheduleType.MONTHLY_DAY_OF_MONTH,
+            day=15,
+            month_interval=2,
+            hour=10,
+            minute=0,
+        ),
+        schedule_draft={
+            "type": "MONTHLY_DAY_OF_MONTH",
+            "day": "15",
+            "month_interval": "2",
+        },
+    )
+
+    metadata = view["private_metadata"]
+    assert '"version":1' in metadata
+    assert '"channel_id":"C1"' in metadata
+    assert '"schedule_draft"' in metadata
+
+
+def test_settings_modal_monthly_day_shows_day_and_interval_only():
+    view = settings_modal(
+        "C1",
+        spec=ScheduleSpec(
+            type=ScheduleType.MONTHLY_DAY_OF_MONTH,
+            day=15,
+            month_interval=2,
+            hour=10,
+            minute=0,
+        ),
+        automatic_enabled=True,
+    )
+
+    ids = _block_ids(view)
+    assert "automatic_execution" in ids
+    assert "day_of_month" in ids
+    assert "month_interval" in ids
+    assert "weekday" not in ids
+    assert "nth" not in ids
+    auto_block = next(block for block in view["blocks"] if block.get("block_id") == "automatic_execution")
+    assert auto_block["element"]["initial_option"]["value"] == "on"
+
+
+def test_settings_modal_monthly_day_block_order_and_generic_date_label():
+    view = settings_modal(
+        "C1",
+        spec=ScheduleSpec(
+            type=ScheduleType.MONTHLY_DAY_OF_MONTH,
+            day=15,
+            month_interval=2,
+            hour=10,
+            minute=0,
+        ),
+    )
+
+    order = _block_order(view)
+    assert order.index("month_interval") < order.index("day_of_month") < order.index("poll_hour")
+    assert _block(view, "day_of_month")["label"]["text"] == "날짜 (1–28)"
+
+
+def test_settings_modal_monthly_nth_shows_weekday_nth_and_interval():
+    view = settings_modal(
+        "C1",
+        spec=ScheduleSpec(
+            type=ScheduleType.MONTHLY_NTH_WEEKDAY,
+            weekday=1,
+            nth=2,
+            month_interval=3,
+            hour=10,
+            minute=0,
+        ),
+    )
+
+    ids = _block_ids(view)
+    assert "weekday" in ids
+    assert "nth" in ids
+    assert "month_interval" in ids
+    assert "day_of_month" not in ids
+
+
+def test_settings_modal_monthly_nth_block_order():
+    view = settings_modal(
+        "C1",
+        spec=ScheduleSpec(
+            type=ScheduleType.MONTHLY_NTH_WEEKDAY,
+            weekday=1,
+            nth=2,
+            month_interval=3,
+            hour=10,
+            minute=0,
+        ),
+    )
+
+    order = _block_order(view)
+    assert order.index("month_interval") < order.index("nth") < order.index("weekday") < order.index("poll_hour")
 
 
 def test_parse_booking_url_accepts_https():
@@ -97,26 +300,16 @@ def test_parse_participant_settings_submission_splits_poll_and_calendar_roles():
     assert poll_targets == ["U1", "U2"]
     assert invitees == [
         CalendarInvitee(value="U1", role="required", kind="slack"),
-        CalendarInvitee(value="required@example.com", role="required", kind="email"),
         CalendarInvitee(value="U3", role="optional", kind="slack"),
-        CalendarInvitee(value="optional@example.com", role="optional", kind="email"),
-        CalendarInvitee(value="U2", role="excluded", kind="slack"),
     ]
 
 
-def test_parse_participant_settings_rejects_malformed_external_email():
+def test_parse_participant_settings_ignores_legacy_external_email_fields():
     view = _view_payload(calendar_required_emails={"value": {"value": "not-an-email"}})
 
-    with pytest.raises(ValueError):
-        parse_participant_settings_submission(view)
+    _poll_targets, invitees = parse_participant_settings_submission(view)
 
-
-def test_parse_participant_settings_rejects_too_long_external_email():
-    local = "a" * (MAX_EMAIL_LENGTH - len("@example.com") + 1)
-    view = _view_payload(calendar_required_emails={"value": {"value": f"{local}@example.com"}})
-
-    with pytest.raises(ValueError):
-        parse_participant_settings_submission(view)
+    assert invitees == []
 
 
 def test_parse_participant_settings_preserves_selected_slack_users():
@@ -152,9 +345,21 @@ def test_settings_modal_prefills_participant_fields():
     assert blocks["calendar_required"]["element"]["initial_users"] == ["U1"]
     assert blocks["calendar_optional"]["element"]["type"] == "multi_users_select"
     assert "initial_users" not in blocks["calendar_optional"]["element"]
-    assert blocks["calendar_excluded"]["element"]["type"] == "multi_users_select"
-    assert blocks["calendar_excluded"]["element"]["initial_users"] == ["U2"]
-    assert blocks["calendar_optional_emails"]["element"]["initial_value"] == "partner@example.com"
+    assert "calendar_required_emails" not in blocks
+    assert "calendar_optional_emails" not in blocks
+    assert "calendar_excluded" not in blocks
+    assert "calendar_excluded_emails" not in blocks
+
+
+def test_settings_modal_does_not_render_separate_poll_target_summary():
+    selected = [f"U{i}" for i in range(1, 23)]
+
+    view = settings_modal("C1", poll_target_ids=selected)
+
+    blocks = {block["block_id"]: block for block in view["blocks"] if "block_id" in block}
+    assert blocks["poll_targets"]["element"]["type"] == "multi_users_select"
+    assert blocks["poll_targets"]["element"]["initial_users"] == selected
+    assert "poll_targets_summary" not in blocks
 
 
 def test_welcome_blocks_have_actions():

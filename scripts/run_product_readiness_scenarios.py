@@ -177,7 +177,12 @@ def run_local_multi_user_scenarios(db_path: str | Path) -> dict[str, Any]:
     _check(checks, "duplicate_poll_guard", dup == m.MSG_POLL_ALREADY_OPEN, str(dup))
 
     invalid = engine.on_poll_vote(run_id, "U_PR_1", "2099-06-20", LOCAL_CHANNEL)
-    _check(checks, "invalid_vote_rejected", invalid == m.MSG_INVALID_POLL_OPTION, invalid)
+    _check(
+        checks,
+        "invalid_vote_rejected",
+        invalid.needs_feedback and invalid.feedback_text == m.MSG_INVALID_POLL_OPTION,
+        str(invalid),
+    )
     _check(checks, "invalid_vote_does_not_count", _votes(session_factory, run_id) == {}, "vote leaked")
 
     poll_dates = _poll_dates(client)

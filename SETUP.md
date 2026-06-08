@@ -58,7 +58,7 @@ Invite your bot to a private Slack test channel:
 /invite @Team Dinner Bot
 ```
 
-Then type `회식`, `회식 help`, `회식 status`, or `회식 지금`.
+Then run `/회식`, `/회식 help`, `/회식 status`, or `/회식 지금`.
 
 ## 5. Local Operator Files
 

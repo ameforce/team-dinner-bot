@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import re
+import json
 from urllib.parse import urlparse
 
 from app import messages as m
@@ -17,23 +17,22 @@ from app.settings_defaults import (
 from app.workflow.participants import CalendarInvitee
 
 SCHEDULE_TYPE_OPTIONS = [
-    {"text": {"type": "plain_text", "text": m.OPT_WEEKLY}, "value": "WEEKLY_WEEKDAY"},
     {"text": {"type": "plain_text", "text": m.OPT_MONTHLY_DAY}, "value": "MONTHLY_DAY_OF_MONTH"},
     {"text": {"type": "plain_text", "text": m.OPT_MONTHLY_NTH}, "value": "MONTHLY_NTH_WEEKDAY"},
 ]
 
+AUTOMATIC_EXECUTION_OPTIONS = [
+    {"text": {"type": "plain_text", "text": m.OPT_AUTOMATIC_ON}, "value": "on"},
+    {"text": {"type": "plain_text", "text": m.OPT_AUTOMATIC_OFF}, "value": "off"},
+]
+
 MAX_BOOKING_URL_LENGTH = 2048
-MAX_EMAIL_LENGTH = 254
-EMAIL_RE = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
+SETTINGS_METADATA_SCHEDULE_DRAFT = "schedule_draft"
 
 WEEKDAY_OPTIONS = [
     {"text": {"type": "plain_text", "text": label}, "value": str(i)}
     for i, label in enumerate(m.WEEKDAYS)
 ]
-
-
-def _option(value: str, label: str) -> dict:
-    return {"text": {"type": "plain_text", "text": label}, "value": value}
 
 
 def _initial_select(options: list[dict], value: str | None) -> dict | None:
@@ -79,15 +78,40 @@ def settings_modal(
     booking_url: str | None = None,
     poll_target_ids: list[str] | None = None,
     calendar_invitees: list[CalendarInvitee] | None = None,
+    automatic_enabled: bool = True,
+    schedule_draft: dict | None = None,
 ) -> dict:
     spec = spec or default_schedule_spec()
+    if schedule_draft is not None:
+        spec = schedule_spec_from_draft(schedule_draft, fallback=spec)
+    legacy_weekly = spec.type == ScheduleType.WEEKLY_WEEKDAY
+    if legacy_weekly:
+        spec = ScheduleSpec(
+            type=ScheduleType.MONTHLY_DAY_OF_MONTH,
+            day=15,
+            month_interval=1,
+            hour=spec.hour,
+            minute=spec.minute,
+        )
     poll_hours = clamp_poll_duration_hours(poll_duration_hours)
     booking_url = booking_url or ""
     poll_target_ids = poll_target_ids or []
     calendar_invitees = calendar_invitees or []
 
+    automatic_initial = _initial_select(
+        AUTOMATIC_EXECUTION_OPTIONS,
+        "on" if automatic_enabled else "off",
+    )
     type_initial = _initial_select(SCHEDULE_TYPE_OPTIONS, spec.type.value)
     weekday_initial = _initial_select(WEEKDAY_OPTIONS, str(spec.weekday if spec.weekday is not None else 1))
+
+    automatic_elem: dict = {
+        "type": "static_select",
+        "action_id": "value",
+        "options": AUTOMATIC_EXECUTION_OPTIONS,
+    }
+    if automatic_initial:
+        automatic_elem["initial_option"] = automatic_initial
 
     schedule_elem: dict = {
         "type": "static_select",
@@ -105,55 +129,39 @@ def settings_modal(
     if weekday_initial:
         weekday_elem["initial_option"] = weekday_initial
 
-    return {
-        "type": "modal",
-        "callback_id": "settings_submit",
-        "private_metadata": channel_id,
-        "title": {"type": "plain_text", "text": m.MODAL_TITLE},
-        "submit": {"type": "plain_text", "text": m.MODAL_SAVE},
-        "close": {"type": "plain_text", "text": m.MODAL_CANCEL},
-        "blocks": [
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": m.MODAL_HELP},
-            },
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": m.MODAL_HELP},
+        },
+        {
+            "type": "input",
+            "block_id": "automatic_execution",
+            "dispatch_action": True,
+            "label": {"type": "plain_text", "text": m.LABEL_AUTOMATIC_EXECUTION},
+            "element": automatic_elem,
+        },
+    ]
+    if automatic_enabled:
+        if legacy_weekly:
+            blocks.append(
+                {
+                    "type": "context",
+                    "block_id": "legacy_weekly_notice",
+                    "elements": [{"type": "mrkdwn", "text": m.LEGACY_WEEKLY_NOTICE}],
+                }
+            )
+        blocks.append(
             {
                 "type": "input",
                 "block_id": "schedule_type",
+                "dispatch_action": True,
                 "label": {"type": "plain_text", "text": m.LABEL_SCHEDULE_TYPE},
                 "element": schedule_elem,
-            },
-            {
-                "type": "input",
-                "block_id": "weekday",
-                "optional": True,
-                "label": {"type": "plain_text", "text": m.LABEL_WEEKDAY},
-                "element": weekday_elem,
-            },
-            {
-                "type": "input",
-                "block_id": "day_of_month",
-                "optional": True,
-                "label": {"type": "plain_text", "text": m.LABEL_DAY},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": str(spec.day if spec.day is not None else 15),
-                    "placeholder": {"type": "plain_text", "text": "15"},
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "nth",
-                "optional": True,
-                "label": {"type": "plain_text", "text": m.LABEL_NTH},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": str(spec.nth if spec.nth is not None else 2),
-                    "placeholder": {"type": "plain_text", "text": "2 (둘째 주), -1=마지막"},
-                },
-            },
+            }
+        )
+        blocks.extend(_schedule_detail_blocks(spec, weekday_elem))
+        blocks.append(
             {
                 "type": "input",
                 "block_id": "poll_hour",
@@ -163,7 +171,10 @@ def settings_modal(
                     "action_id": "value",
                     "initial_value": str(spec.hour),
                 },
-            },
+            }
+        )
+    blocks.extend(
+        [
             {
                 "type": "input",
                 "block_id": "poll_duration",
@@ -209,20 +220,6 @@ def settings_modal(
             },
             {
                 "type": "input",
-                "block_id": "calendar_required_emails",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "캘린더 필수 외부 이메일"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": _join_values(
-                        _invitee_values(calendar_invitees, "required", "email")
-                    ),
-                    "multiline": True,
-                },
-            },
-            {
-                "type": "input",
                 "block_id": "calendar_optional",
                 "optional": True,
                 "label": {"type": "plain_text", "text": "캘린더 선택 초대"},
@@ -231,46 +228,78 @@ def settings_modal(
                     "선택 초대자 선택",
                 ),
             },
-            {
-                "type": "input",
-                "block_id": "calendar_optional_emails",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "캘린더 선택 외부 이메일"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": _join_values(
-                        _invitee_values(calendar_invitees, "optional", "email")
-                    ),
-                    "multiline": True,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "calendar_excluded",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "캘린더 초대 제외"},
-                "element": _multi_users_element(
-                    _invitee_values(calendar_invitees, "excluded", "slack"),
-                    "초대 제외자 선택",
-                ),
-            },
-            {
-                "type": "input",
-                "block_id": "calendar_excluded_emails",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "캘린더 제외 외부 이메일"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": _join_values(
-                        _invitee_values(calendar_invitees, "excluded", "email")
-                    ),
-                    "multiline": True,
-                },
-            },
-        ],
+        ]
+    )
+
+    return {
+        "type": "modal",
+        "callback_id": "settings_submit",
+        "private_metadata": encode_settings_metadata(channel_id, schedule_draft),
+        "title": {"type": "plain_text", "text": m.MODAL_TITLE},
+        "submit": {"type": "plain_text", "text": m.MODAL_SAVE},
+        "close": {"type": "plain_text", "text": m.MODAL_CANCEL},
+        "blocks": blocks,
     }
+
+
+def _schedule_detail_blocks(spec: ScheduleSpec, weekday_elem: dict) -> list[dict]:
+    blocks: list[dict] = []
+    if spec.type in {ScheduleType.MONTHLY_DAY_OF_MONTH, ScheduleType.MONTHLY_NTH_WEEKDAY}:
+        blocks.append(
+            {
+                "type": "input",
+                "block_id": "month_interval",
+                "optional": True,
+                "label": {"type": "plain_text", "text": m.LABEL_MONTH_INTERVAL},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "initial_value": str(spec.month_interval),
+                    "placeholder": {"type": "plain_text", "text": "1"},
+                },
+            }
+        )
+    if spec.type == ScheduleType.MONTHLY_DAY_OF_MONTH:
+        blocks.append(
+            {
+                "type": "input",
+                "block_id": "day_of_month",
+                "optional": True,
+                "label": {"type": "plain_text", "text": m.LABEL_DAY},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "initial_value": str(spec.day if spec.day is not None else 15),
+                    "placeholder": {"type": "plain_text", "text": "15"},
+                },
+            }
+        )
+    if spec.type == ScheduleType.MONTHLY_NTH_WEEKDAY:
+        blocks.append(
+            {
+                "type": "input",
+                "block_id": "nth",
+                "optional": True,
+                "label": {"type": "plain_text", "text": m.LABEL_NTH},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "initial_value": str(spec.nth if spec.nth is not None else 2),
+                    "placeholder": {"type": "plain_text", "text": "2 (둘째 주), -1=마지막"},
+                },
+            }
+        )
+    if spec.type == ScheduleType.MONTHLY_NTH_WEEKDAY:
+        blocks.append(
+            {
+                "type": "input",
+                "block_id": "weekday",
+                "optional": True,
+                "label": {"type": "plain_text", "text": m.LABEL_WEEKDAY},
+                "element": weekday_elem,
+            }
+        )
+    return blocks
 
 
 def loading_settings_modal(channel_id: str) -> dict:
@@ -289,41 +318,141 @@ def loading_settings_modal(channel_id: str) -> dict:
     }
 
 
-def _join_values(values: list[str]) -> str:
-    return ", ".join(values)
+def encode_settings_metadata(channel_id: str, schedule_draft: dict | None = None) -> str:
+    if not schedule_draft:
+        return channel_id
+    return json.dumps(
+        {
+            "version": 1,
+            "channel_id": channel_id,
+            SETTINGS_METADATA_SCHEDULE_DRAFT: schedule_draft,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def decode_settings_metadata(raw: object) -> tuple[str | None, dict]:
+    if not isinstance(raw, str):
+        return None, {}
+    raw = raw.strip()
+    if not raw:
+        return None, {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw, {}
+    if not isinstance(payload, dict):
+        return raw, {}
+    channel_id = payload.get("channel_id")
+    schedule_draft = payload.get(SETTINGS_METADATA_SCHEDULE_DRAFT)
+    return (
+        channel_id.strip() if isinstance(channel_id, str) and channel_id.strip() else None,
+        schedule_draft if isinstance(schedule_draft, dict) else {},
+    )
+
+
+def schedule_draft_from_view(
+    view: dict,
+    *,
+    previous_draft: dict | None = None,
+    selected_type: str | None = None,
+) -> dict:
+    values = _view_values(view)
+    draft = dict(previous_draft or {})
+    if selected_type:
+        draft["type"] = selected_type
+    for block_id, key in (
+        ("schedule_type", "type"),
+        ("weekday", "weekday"),
+        ("day_of_month", "day"),
+        ("nth", "nth"),
+        ("month_interval", "month_interval"),
+        ("poll_hour", "hour"),
+    ):
+        raw = _pick_value(values, block_id)
+        if raw not in (None, ""):
+            draft[key] = raw
+    return draft
+
+
+def schedule_draft_from_spec(spec: ScheduleSpec) -> dict:
+    draft: dict[str, int | str] = {
+        "type": spec.type.value,
+        "hour": spec.hour,
+    }
+    if spec.weekday is not None:
+        draft["weekday"] = spec.weekday
+    if spec.day is not None:
+        draft["day"] = spec.day
+    if spec.nth is not None:
+        draft["nth"] = spec.nth
+    draft["month_interval"] = spec.month_interval
+    return draft
+
+
+def schedule_spec_from_draft(
+    draft: dict,
+    *,
+    fallback: ScheduleSpec | None = None,
+) -> ScheduleSpec:
+    fallback = fallback or default_schedule_spec()
+    schedule_type = ScheduleType(str(draft.get("type") or fallback.type.value))
+    spec_kwargs: dict = {
+        "type": schedule_type,
+        "hour": fallback.hour,
+        "minute": fallback.minute,
+    }
+    for key in ("weekday", "day", "nth", "month_interval", "hour"):
+        value = _int_or_none(draft.get(key))
+        if value is not None:
+            spec_kwargs[key] = value
+    if schedule_type == ScheduleType.WEEKLY_WEEKDAY:
+        spec_kwargs.setdefault("weekday", fallback.weekday if fallback.weekday is not None else 1)
+    elif schedule_type == ScheduleType.MONTHLY_DAY_OF_MONTH:
+        spec_kwargs.setdefault("day", fallback.day if fallback.day is not None else 15)
+        spec_kwargs.setdefault("month_interval", fallback.month_interval)
+    elif schedule_type == ScheduleType.MONTHLY_NTH_WEEKDAY:
+        spec_kwargs.setdefault("weekday", fallback.weekday if fallback.weekday is not None else 1)
+        spec_kwargs.setdefault("nth", fallback.nth if fallback.nth is not None else 2)
+        spec_kwargs.setdefault("month_interval", fallback.month_interval)
+    return ScheduleSpec(**spec_kwargs)
+
+
+def _int_or_none(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip():
+        return int(value)
+    return None
+
+
+def parse_automatic_execution_enabled(view: dict) -> bool:
+    values = _view_values(view)
+    raw = _pick_value(values, "automatic_execution")
+    if raw is None:
+        return True
+    if raw == "on":
+        return True
+    if raw == "off":
+        return False
+    raise ValueError("automatic_execution invalid")
 
 
 def parse_settings_submission(view: dict) -> tuple[ScheduleSpec, int, str | None]:
     values = _view_values(view)
 
-    def pick(block_id: str, field: str = "value") -> str | None:
-        block = _block_values(values, block_id)
-        elem = _element_values(block, field)
-        if not elem:
-            return None
-        selected = elem.get("selected_option")
-        if selected:
-            if not isinstance(selected, dict):
-                raise ValueError(f"{block_id} selected_option invalid")
-            value = selected.get("value")
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{block_id} selected_option value invalid")
-            return value
-        value = elem.get("value")
-        if value is not None and not isinstance(value, str):
-            raise ValueError(f"{block_id} value invalid")
-        return value
-
-    schedule_type = pick("schedule_type")
+    schedule_type = _pick_value(values, "schedule_type")
     if not schedule_type:
         raise ValueError("schedule_type required")
 
-    weekday_raw = pick("weekday")
-    day_raw = pick("day_of_month")
-    nth_raw = pick("nth")
-    hour_raw = pick("poll_hour") or "10"
-    duration_raw = pick("poll_duration") or str(DEFAULT_POLL_DURATION_HOURS)
-    booking_url = _validate_booking_url((pick("booking_url") or "").strip() or None)
+    weekday_raw = _pick_value(values, "weekday")
+    day_raw = _pick_value(values, "day_of_month")
+    nth_raw = _pick_value(values, "nth")
+    month_interval_raw = _pick_value(values, "month_interval")
+    hour_raw = _pick_value(values, "poll_hour") or "10"
+    duration_raw = _pick_value(values, "poll_duration") or str(DEFAULT_POLL_DURATION_HOURS)
+    booking_url = _validate_booking_url((_pick_value(values, "booking_url") or "").strip() or None)
 
     hour = int(hour_raw)
     poll_duration = clamp_poll_duration_hours(int(duration_raw))
@@ -339,16 +468,27 @@ def parse_settings_submission(view: dict) -> tuple[ScheduleSpec, int, str | None
         spec_kwargs["day"] = int(day_raw)
     if nth_raw:
         spec_kwargs["nth"] = int(nth_raw)
+    if month_interval_raw:
+        spec_kwargs["month_interval"] = int(month_interval_raw)
 
     if spec_kwargs["type"] == ScheduleType.WEEKLY_WEEKDAY:
         spec_kwargs.setdefault("weekday", 1)
     elif spec_kwargs["type"] == ScheduleType.MONTHLY_DAY_OF_MONTH:
         spec_kwargs.setdefault("day", 15)
+        spec_kwargs.setdefault("month_interval", 1)
     elif spec_kwargs["type"] == ScheduleType.MONTHLY_NTH_WEEKDAY:
         spec_kwargs.setdefault("weekday", 1)
         spec_kwargs.setdefault("nth", 2)
+        spec_kwargs.setdefault("month_interval", 1)
 
     return ScheduleSpec(**spec_kwargs), poll_duration, booking_url
+
+
+def parse_non_schedule_settings_submission(view: dict) -> tuple[int, str | None]:
+    values = _view_values(view)
+    duration_raw = _pick_value(values, "poll_duration") or str(DEFAULT_POLL_DURATION_HOURS)
+    booking_url = _validate_booking_url((_pick_value(values, "booking_url") or "").strip() or None)
+    return clamp_poll_duration_hours(int(duration_raw)), booking_url
 
 
 def parse_participant_settings_submission(view: dict) -> tuple[list[str], list[CalendarInvitee]]:
@@ -380,15 +520,10 @@ def parse_participant_settings_submission(view: dict) -> tuple[list[str], list[C
     for role, block_id in (
         ("required", "calendar_required"),
         ("optional", "calendar_optional"),
-        ("excluded", "calendar_excluded"),
     ):
         invitees.extend(
-            CalendarInvitee(value=token, role=role, kind=_invitee_kind(token))
+            CalendarInvitee(value=token, role=role, kind="slack")
             for token in pick_users(block_id)
-        )
-        invitees.extend(
-            CalendarInvitee(value=token, role=role, kind="email")
-            for token in _email_tokens(pick_text(f"{block_id}_emails"))
         )
     return poll_targets, _dedupe_invitees(invitees)
 
@@ -423,6 +558,25 @@ def _element_values(block: dict, field: str) -> dict:
     return elem
 
 
+def _pick_value(values: dict, block_id: str, field: str = "value") -> str | None:
+    block = _block_values(values, block_id)
+    elem = _element_values(block, field)
+    if not elem:
+        return None
+    selected = elem.get("selected_option")
+    if selected:
+        if not isinstance(selected, dict):
+            raise ValueError(f"{block_id} selected_option invalid")
+        value = selected.get("value")
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{block_id} selected_option value invalid")
+        return value
+    value = elem.get("value")
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{block_id} value invalid")
+    return value
+
+
 def _validate_booking_url(value: str | None) -> str | None:
     if not value:
         return None
@@ -449,25 +603,6 @@ def _dedupe_invitees(invitees: list[CalendarInvitee]) -> list[CalendarInvitee]:
 
 def _split_tokens(raw: str) -> list[str]:
     return [token for token in raw.replace(",", " ").split() if token]
-
-
-def _email_tokens(raw: str) -> list[str]:
-    return [_validate_email(token) for token in _split_tokens(raw)]
-
-
-def _validate_email(value: str) -> str:
-    if (
-        not value
-        or len(value) > MAX_EMAIL_LENGTH
-        or any(ord(ch) < 32 for ch in value)
-        or not EMAIL_RE.fullmatch(value)
-    ):
-        raise ValueError(f"invalid external email: {value}")
-    return value
-
-
-def _invitee_kind(value: str) -> str:
-    return "email" if "@" in value else "slack"
 
 
 def welcome_blocks() -> list[dict]:

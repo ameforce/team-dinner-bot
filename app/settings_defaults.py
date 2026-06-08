@@ -13,8 +13,9 @@ MAX_POLL_DURATION_HOURS = 168
 
 def default_schedule_spec() -> ScheduleSpec:
     return ScheduleSpec(
-        type=ScheduleType.WEEKLY_WEEKDAY,
-        weekday=1,
+        type=ScheduleType.MONTHLY_DAY_OF_MONTH,
+        day=15,
+        month_interval=1,
         hour=10,
         minute=0,
     )

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db.models import AssigneeHistory, Channel, PollVote, WorkflowRun
 from app.schedule.spec import ScheduleSpec
 from app.settings_defaults import (
@@ -65,6 +67,10 @@ class ChannelRepository:
         row = self.get_by_channel_id(channel_id)
         if not row:
             raise ValueError(f"Channel not registered: {channel_id}")
+        previous_spec = (
+            ScheduleSpec.model_validate_json(row.schedule_json) if row.schedule_json else None
+        )
+        spec = _prepare_schedule_for_save(spec, previous_spec, row.tz or settings.default_timezone)
         row.schedule_json = spec.model_dump_json()
         row.poll_duration_hours = clamp_poll_duration_hours(poll_duration_hours)
         self.session.commit()
@@ -82,18 +88,29 @@ class ChannelRepository:
         poll_target_ids: list[str],
         calendar_invitees: list[CalendarInvitee],
         channel_member_ids: list[str],
+        automatic_execution_enabled: bool,
     ) -> Channel:
         team_id = team_id.strip()
         row = self.get_by_channel_id(channel_id)
         if not row:
             if not team_id:
                 raise ValueError(f"Team id required for new channel: {channel_id}")
-            row = Channel(team_id=team_id, channel_id=channel_id, enabled=True)
+            row = Channel(
+                team_id=team_id,
+                channel_id=channel_id,
+                enabled=True,
+                automatic_execution_enabled=automatic_execution_enabled,
+            )
             self.session.add(row)
         elif team_id:
             row.team_id = team_id
         elif not row.team_id.strip():
             raise ValueError(f"Team id required for channel: {channel_id}")
+        previous_spec = (
+            ScheduleSpec.model_validate_json(row.schedule_json) if row.schedule_json else None
+        )
+        spec = _prepare_schedule_for_save(spec, previous_spec, row.tz or settings.default_timezone)
+        row.automatic_execution_enabled = automatic_execution_enabled
         row.schedule_json = spec.model_dump_json()
         row.poll_duration_hours = clamp_poll_duration_hours(poll_duration_hours)
         row.booking_url_template = booking_url
@@ -233,3 +250,39 @@ class WorkflowRepository:
             .order_by(AssigneeHistory.run_at.desc())
         )
         return row.user_id if row else None
+
+
+def _prepare_schedule_for_save(
+    spec: ScheduleSpec,
+    previous_spec: ScheduleSpec | None,
+    tz_name: str,
+) -> ScheduleSpec:
+    if _same_monthly_cadence(spec, previous_spec) and _has_month_anchor(previous_spec):
+        return spec.model_copy(
+            update={
+                "month_anchor_year": previous_spec.month_anchor_year,
+                "month_anchor_month": previous_spec.month_anchor_month,
+            }
+        )
+    anchor = datetime.now(ZoneInfo(tz_name))
+    return spec.with_month_anchor(anchor, tz_name)
+
+
+def _same_monthly_cadence(spec: ScheduleSpec, previous_spec: ScheduleSpec | None) -> bool:
+    if previous_spec is None:
+        return False
+    return (
+        spec.type == previous_spec.type
+        and spec.weekday == previous_spec.weekday
+        and spec.day == previous_spec.day
+        and spec.nth == previous_spec.nth
+        and spec.month_interval == previous_spec.month_interval
+    )
+
+
+def _has_month_anchor(spec: ScheduleSpec | None) -> bool:
+    return bool(
+        spec
+        and spec.month_anchor_year is not None
+        and spec.month_anchor_month is not None
+    )
