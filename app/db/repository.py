@@ -5,10 +5,18 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db.models import AssigneeHistory, Channel, PollVote, WorkflowRun
+from app.db.models import (
+    AssigneeHistory,
+    Channel,
+    ChannelRunClaim,
+    OutboundEffect,
+    PollVote,
+    WorkflowRun,
+)
 from app.schedule.spec import ScheduleSpec
 from app.settings_defaults import (
     DEFAULT_POLL_DURATION_HOURS,
@@ -16,9 +24,16 @@ from app.settings_defaults import (
     default_schedule_spec,
 )
 from app.workflow.participants import CalendarInvitee, ids_to_json, invitees_to_json
+from app.workflow.states import OutboundEffectStatus, WorkflowState
 
-_POLL_OPEN_STATES = ("POLL_OPEN", "REMIND_POSTED")
-_ACTIVE_STATES = ("POLL_OPEN", "REMIND_POSTED", "POLL_CLOSED", "BOOKING_ASSIGNED")
+_POLL_OPEN_STATES = (WorkflowState.POLL_STARTING, WorkflowState.POLL_OPEN)
+_ACTIVE_STATES = (
+    WorkflowState.POLL_STARTING,
+    WorkflowState.POLL_OPEN,
+    WorkflowState.CLOSE_COMPUTED,
+    WorkflowState.ASSIGNEE_SELECTED,
+    WorkflowState.NEEDS_ATTENTION,
+)
 
 
 class ChannelRepository:
@@ -36,11 +51,15 @@ class ChannelRepository:
         team_id = team_id.strip()
         row = self.get_by_channel_id(channel_id)
         if row:
+            changed = not row.enabled
             row.enabled = True
             if team_id:
+                changed = changed or row.team_id != team_id
                 row.team_id = team_id
             elif not row.team_id.strip():
                 raise ValueError(f"Team id required for channel: {channel_id}")
+            if changed:
+                row.settings_revision = (row.settings_revision or 0) + 1
             self.session.commit()
             return row
         if not team_id:
@@ -60,7 +79,9 @@ class ChannelRepository:
     def disable_channel(self, channel_id: str) -> None:
         row = self.get_by_channel_id(channel_id)
         if row:
-            row.enabled = False
+            if row.enabled:
+                row.enabled = False
+                row.settings_revision = (row.settings_revision or 0) + 1
             self.session.commit()
 
     def save_schedule(self, channel_id: str, spec: ScheduleSpec, poll_duration_hours: int) -> Channel:
@@ -73,6 +94,7 @@ class ChannelRepository:
         spec = _prepare_schedule_for_save(spec, previous_spec, row.tz or settings.default_timezone)
         row.schedule_json = spec.model_dump_json()
         row.poll_duration_hours = clamp_poll_duration_hours(poll_duration_hours)
+        row.settings_revision = (row.settings_revision or 0) + 1
         self.session.commit()
         self.session.refresh(row)
         return row
@@ -117,6 +139,7 @@ class ChannelRepository:
         row.poll_target_ids_json = ids_to_json(poll_target_ids)
         row.calendar_invitees_json = invitees_to_json(calendar_invitees)
         row.channel_member_ids_json = ids_to_json(channel_member_ids)
+        row.settings_revision = (row.settings_revision or 0) + 1
         self.session.commit()
         self.session.refresh(row)
         return row
@@ -141,6 +164,7 @@ class ChannelRepository:
         row.poll_target_ids_json = ids_to_json(poll_target_ids)
         row.calendar_invitees_json = invitees_to_json(calendar_invitees)
         row.channel_member_ids_json = ids_to_json(channel_member_ids)
+        row.settings_revision = (row.settings_revision or 0) + 1
         self.session.commit()
         self.session.refresh(row)
         return row
@@ -151,20 +175,18 @@ class WorkflowRepository:
         self.session = session
 
     def get_open_run(self, channel_db_id: int) -> WorkflowRun | None:
-        return self.session.scalar(
-            select(WorkflowRun)
-            .where(WorkflowRun.channel_id == channel_db_id)
-            .where(WorkflowRun.state.in_(_POLL_OPEN_STATES))
-            .order_by(WorkflowRun.id.desc())
-        )
+        claim = self.session.get(ChannelRunClaim, channel_db_id)
+        if not claim:
+            return None
+        run = self.session.get(WorkflowRun, claim.run_id)
+        return run if run and run.state in _POLL_OPEN_STATES else None
 
     def get_active_run(self, channel_db_id: int) -> WorkflowRun | None:
-        return self.session.scalar(
-            select(WorkflowRun)
-            .where(WorkflowRun.channel_id == channel_db_id)
-            .where(WorkflowRun.state.in_(_ACTIVE_STATES))
-            .order_by(WorkflowRun.id.desc())
-        )
+        claim = self.session.get(ChannelRunClaim, channel_db_id)
+        if not claim:
+            return None
+        run = self.session.get(WorkflowRun, claim.run_id)
+        return run if run and run.state in _ACTIVE_STATES else None
 
     def list_open_runs(self, channel_db_id: int) -> list[WorkflowRun]:
         return list(
@@ -204,12 +226,170 @@ class WorkflowRepository:
         self.session.refresh(run)
         return run
 
-    def update_run(self, run: WorkflowRun, **fields) -> WorkflowRun:
-        for k, v in fields.items():
-            setattr(run, k, v)
+    def create_claimed_run(
+        self,
+        channel_db_id: int,
+        *,
+        state: str = WorkflowState.POLL_STARTING,
+        scheduled_for: datetime | None = None,
+        poll_deadline: datetime | None = None,
+        target_member_ids_json: str | None = None,
+        poll_semantics: str | None = "unavailable",
+        initial_effect_type: str | None = None,
+        initial_effect_payload_json: str | None = None,
+    ) -> WorkflowRun | None:
+        run = WorkflowRun(
+            channel_id=channel_db_id,
+            state=state,
+            scheduled_for=scheduled_for,
+            poll_deadline=poll_deadline,
+            target_member_ids_json=target_member_ids_json,
+            poll_semantics=poll_semantics,
+        )
+        try:
+            self.session.add(run)
+            self.session.flush()
+            self.session.add(
+                ChannelRunClaim(
+                    channel_id=channel_db_id,
+                    run_id=run.id,
+                    claim_version=1,
+                )
+            )
+            if initial_effect_type:
+                self.session.add(
+                    OutboundEffect(
+                        aggregate_type="workflow_run",
+                        aggregate_id=str(run.id),
+                        effect_type=initial_effect_type,
+                        idempotency_key=(
+                            f"run:{run.id}:{str(initial_effect_type).lower().replace('_', '-')}:v1"
+                        ),
+                        status=OutboundEffectStatus.PENDING,
+                        payload_json=initial_effect_payload_json,
+                        payload_version=1,
+                    )
+                )
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            return None
+        self.session.refresh(run)
+        return run
+
+    def transition_with_effect(
+        self,
+        run: WorkflowRun,
+        effect: OutboundEffect,
+        *,
+        effect_status: OutboundEffectStatus,
+        remote_ref: str | None = None,
+        error_code: str | None = None,
+        increment_attempt: bool = False,
+        **run_fields,
+    ) -> WorkflowRun:
+        for key, value in run_fields.items():
+            setattr(run, key, value)
+        effect.status = effect_status
+        effect.remote_ref = remote_ref
+        effect.error_code = error_code
+        if increment_attempt:
+            effect.attempt_count = (effect.attempt_count or 0) + 1
+        if run.state in (WorkflowState.DONE, WorkflowState.FAILED):
+            claim = self.session.get(ChannelRunClaim, run.channel_id)
+            if claim and claim.run_id == run.id:
+                self.session.delete(claim)
         self.session.commit()
         self.session.refresh(run)
         return run
+
+    def update_run(self, run: WorkflowRun, **fields) -> WorkflowRun:
+        for k, v in fields.items():
+            setattr(run, k, v)
+        if run.state in (WorkflowState.DONE, WorkflowState.FAILED):
+            claim = self.session.get(ChannelRunClaim, run.channel_id)
+            if claim and claim.run_id == run.id:
+                self.session.delete(claim)
+        self.session.commit()
+        self.session.refresh(run)
+        return run
+
+    def release_claim(self, run: WorkflowRun) -> None:
+        claim = self.session.get(ChannelRunClaim, run.channel_id)
+        if claim and claim.run_id == run.id:
+            self.session.delete(claim)
+            self.session.commit()
+
+    def list_nonterminal_runs(self) -> list[WorkflowRun]:
+        return list(
+            self.session.scalars(
+                select(WorkflowRun)
+                .where(WorkflowRun.state.in_(_ACTIVE_STATES))
+                .order_by(WorkflowRun.id)
+            ).all()
+        )
+
+    def get_effect(
+        self, aggregate_type: str, aggregate_id: str, effect_type: str
+    ) -> OutboundEffect | None:
+        return self.session.scalar(
+            select(OutboundEffect)
+            .where(OutboundEffect.aggregate_type == aggregate_type)
+            .where(OutboundEffect.aggregate_id == aggregate_id)
+            .where(OutboundEffect.effect_type == effect_type)
+            .order_by(OutboundEffect.id.desc())
+        )
+
+    def ensure_effect(
+        self,
+        *,
+        aggregate_type: str,
+        aggregate_id: str,
+        effect_type: str,
+        idempotency_key: str,
+        payload_json: str | None = None,
+        payload_version: int = 1,
+    ) -> OutboundEffect:
+        existing = self.session.scalar(
+            select(OutboundEffect).where(
+                OutboundEffect.idempotency_key == idempotency_key
+            )
+        )
+        if existing:
+            return existing
+        effect = OutboundEffect(
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            effect_type=effect_type,
+            idempotency_key=idempotency_key,
+            status=OutboundEffectStatus.PENDING,
+            payload_json=payload_json,
+            payload_version=payload_version,
+        )
+        self.session.add(effect)
+        self.session.commit()
+        self.session.refresh(effect)
+        return effect
+
+    def update_effect(
+        self,
+        effect: OutboundEffect,
+        *,
+        status: OutboundEffectStatus,
+        remote_ref: str | None = None,
+        error_code: str | None = None,
+        next_attempt_at: datetime | None = None,
+        increment_attempt: bool = False,
+    ) -> OutboundEffect:
+        effect.status = status
+        effect.remote_ref = remote_ref
+        effect.error_code = error_code
+        effect.next_attempt_at = next_attempt_at
+        if increment_attempt:
+            effect.attempt_count = (effect.attempt_count or 0) + 1
+        self.session.commit()
+        self.session.refresh(effect)
+        return effect
 
     def toggle_vote(self, run_id: int, slack_user_id: str, date_iso: str) -> bool:
         """Toggle vote; returns True if vote added, False if removed."""
@@ -239,8 +419,20 @@ class WorkflowRepository:
         self.session.execute(delete(PollVote).where(PollVote.run_id == run_id))
         self.session.commit()
 
-    def record_assignee(self, channel_db_id: int, user_id: str) -> None:
-        self.session.add(AssigneeHistory(channel_id=channel_db_id, user_id=user_id))
+    def record_assignee(
+        self, channel_db_id: int, user_id: str, *, run_id: int | None = None
+    ) -> None:
+        if run_id is not None and self.session.scalar(
+            select(AssigneeHistory).where(AssigneeHistory.run_id == run_id)
+        ):
+            return
+        self.session.add(
+            AssigneeHistory(
+                channel_id=channel_db_id,
+                run_id=run_id,
+                user_id=user_id,
+            )
+        )
         self.session.commit()
 
     def last_assignee(self, channel_db_id: int) -> str | None:

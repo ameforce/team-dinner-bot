@@ -2,40 +2,37 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
-
 from sqlalchemy.orm import sessionmaker
 
 from app import messages as m
 from app.config import settings
 from app.db.repository import ChannelRepository
 from app.schedule.spec import ScheduleSpec
+from app.rendering import render_status
 from app.scheduler.runner import JobScheduler
 from app.slack_invocation import USER_CMD
 from app.workflow.engine import WorkflowEngine
 
 
-def format_status(channel_id: str, session_factory: sessionmaker) -> str:
+def format_status(
+    channel_id: str,
+    session_factory: sessionmaker,
+    job_scheduler: JobScheduler | None = None,
+) -> str:
     with session_factory() as session:
         ch = ChannelRepository(session).get_by_channel_id(channel_id)
     if not ch or not ch.schedule_json:
         return m.MSG_NO_SCHEDULE
     spec = ScheduleSpec.model_validate_json(ch.schedule_json)
-    lines = [
-        m.MSG_STATUS_HEADER,
-        f"자동 실행: {'사용' if ch.automatic_execution_enabled else '사용 안 함'}",
-        f"\uC77C\uC815: {spec.describe_ko()}",
-    ]
-    if ch.automatic_execution_enabled:
-        nxt = spec.next_run_after(datetime.now(), ch.tz)
-        lines.append(f"\uB2E4\uC74C \uC2E4\uD589: {nxt.strftime('%Y-%m-%d %H:%M')} ({ch.tz})")
-    lines.extend(
-        [
-            f"\uD22C\uD45C: {ch.poll_duration_hours}\uC2DC\uAC04",
-            "Google 캘린더: 설정 시 직접 생성, 미설정 시 예약 담당자 DM에 생성 링크 제공",
-        ]
-    )
-    return "\n".join(lines)
+    scheduler_state = job_scheduler.read_channel(channel_id) if job_scheduler else None
+    return render_status(
+        schedule_description=spec.describe_ko(),
+        automatic_enabled=ch.automatic_execution_enabled,
+        poll_duration_hours=ch.poll_duration_hours,
+        timezone_name=ch.tz,
+        scheduler_applied=bool(scheduler_state and scheduler_state.applied),
+        next_run=scheduler_state.next_run if scheduler_state else None,
+    ).text
 
 
 def help_text() -> str:
@@ -75,7 +72,7 @@ def dispatch_hoesik_intent(
     sub = parts[0].lower() if parts else ""
 
     if sub in ("status", "\uc0c1\ud0dc", "\uc77c\uc815"):
-        reply(format_status(channel_id, session_factory))
+        reply(format_status(channel_id, session_factory, job_scheduler))
         if post_action_prompt is not None:
             post_action_prompt()
         return

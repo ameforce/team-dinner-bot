@@ -517,10 +517,51 @@ def test_settings_submit_saves_automatic_execution_off(session_factory):
 
     ack.assert_called_once()
     scheduler.schedule_channel.assert_called_once_with(CHANNEL)
+    assert client.chat_postMessage.call_args.kwargs["text"] == (
+        "설정을 저장했습니다.\n"
+        "• 자동 실행: 사용 안 함\n"
+        "• 투표 마감: 시작 후 36시간"
+    )
     with session_factory() as session:
         ch = ChannelRepository(session).get_by_channel_id(CHANNEL)
         assert ch.enabled is True
         assert ch.automatic_execution_enabled is False
+
+
+def test_settings_submit_reports_scheduler_pending_without_successful_next_run(
+    session_factory,
+):
+    app = FakeApp()
+    client = MagicMock()
+    client.conversations_members.return_value = {"members": ["U1"]}
+    client.users_info.return_value = {
+        "user": {
+            "id": "U1",
+            "is_bot": False,
+            "deleted": False,
+            "profile": {"display_name": "U1"},
+        }
+    }
+    scheduler = MagicMock()
+    scheduler.schedule_channel.side_effect = RuntimeError("scheduler down")
+    register_command_handlers(
+        app,
+        session_factory,
+        engine=MagicMock(),
+        job_scheduler=scheduler,
+    )
+
+    app.views["settings_submit"](
+        MagicMock(),
+        {"user": {"id": "U1"}},
+        client,
+        _settings_view(),
+    )
+
+    text = client.chat_postMessage.call_args.kwargs["text"]
+    assert "자동 실행 반영 지연" in text
+    assert "다음 실행:" not in text
+    assert "scheduler down" not in text
 
 
 def test_settings_submit_auto_off_without_schedule_fields_preserves_existing_schedule(session_factory):
@@ -931,8 +972,11 @@ def test_settings_submit_invalid_view_notifies_channel(session_factory):
 
     app.views["settings_submit"](ack, {}, client, {"private_metadata": CHANNEL, "state": {"values": {}}})
 
-    ack.assert_called_once()
-    client.chat_postMessage.assert_called_once_with(channel=CHANNEL, text=m.MSG_SETTINGS_INVALID)
+    ack.assert_called_once_with(
+        response_action="errors",
+        errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+    )
+    client.chat_postMessage.assert_not_called()
 
 
 def test_settings_submit_malformed_selected_option_notifies_channel(session_factory):
@@ -945,8 +989,11 @@ def test_settings_submit_malformed_selected_option_notifies_channel(session_fact
 
     app.views["settings_submit"](ack, {}, client, view)
 
-    ack.assert_called_once()
-    client.chat_postMessage.assert_called_once_with(channel=CHANNEL, text=m.MSG_SETTINGS_INVALID)
+    ack.assert_called_once_with(
+        response_action="errors",
+        errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+    )
+    client.chat_postMessage.assert_not_called()
 
 
 def test_settings_submit_malformed_state_notifies_channel(session_factory):
@@ -957,8 +1004,11 @@ def test_settings_submit_malformed_state_notifies_channel(session_factory):
 
     app.views["settings_submit"](ack, {}, client, {"private_metadata": CHANNEL, "state": {}})
 
-    ack.assert_called_once()
-    client.chat_postMessage.assert_called_once_with(channel=CHANNEL, text=m.MSG_SETTINGS_INVALID)
+    ack.assert_called_once_with(
+        response_action="errors",
+        errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+    )
+    client.chat_postMessage.assert_not_called()
 
 
 def test_settings_submit_missing_private_metadata_does_not_post(session_factory):
@@ -987,8 +1037,11 @@ def test_settings_submit_missing_channel_without_team_does_not_create_sentinel(t
 
     app.views["settings_submit"](ack, {}, client, _settings_view())
 
-    ack.assert_called_once()
-    client.chat_postMessage.assert_called_once_with(channel=CHANNEL, text=m.MSG_SETTINGS_INVALID)
+    ack.assert_called_once_with(
+        response_action="errors",
+        errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+    )
+    client.chat_postMessage.assert_not_called()
     client.conversations_members.assert_not_called()
     with factory() as session:
         assert ChannelRepository(session).get_by_channel_id(CHANNEL) is None
@@ -1006,8 +1059,11 @@ def test_settings_submit_missing_channel_with_blank_team_does_not_create_sentine
 
     app.views["settings_submit"](ack, {"team": {"id": "   "}}, client, _settings_view())
 
-    ack.assert_called_once()
-    client.chat_postMessage.assert_called_once_with(channel=CHANNEL, text=m.MSG_SETTINGS_INVALID)
+    ack.assert_called_once_with(
+        response_action="errors",
+        errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+    )
+    client.chat_postMessage.assert_not_called()
     client.conversations_members.assert_not_called()
     with factory() as session:
         assert ChannelRepository(session).get_by_channel_id(CHANNEL) is None
@@ -1025,8 +1081,11 @@ def test_settings_submit_existing_blank_team_without_team_notifies_channel(sessi
 
     app.views["settings_submit"](ack, {}, client, _settings_view())
 
-    ack.assert_called_once()
-    client.chat_postMessage.assert_called_once_with(channel=CHANNEL, text=m.MSG_SETTINGS_INVALID)
+    ack.assert_called_once_with(
+        response_action="errors",
+        errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+    )
+    client.chat_postMessage.assert_not_called()
     client.conversations_members.assert_not_called()
 
 
@@ -1042,8 +1101,11 @@ def test_settings_submit_existing_blank_team_with_blank_team_notifies_channel(se
 
     app.views["settings_submit"](ack, {"team": {"id": "   "}}, client, _settings_view())
 
-    ack.assert_called_once()
-    client.chat_postMessage.assert_called_once_with(channel=CHANNEL, text=m.MSG_SETTINGS_INVALID)
+    ack.assert_called_once_with(
+        response_action="errors",
+        errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+    )
+    client.chat_postMessage.assert_not_called()
     client.conversations_members.assert_not_called()
 
 
