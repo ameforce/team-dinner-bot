@@ -7,6 +7,8 @@ from typing import Callable
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from app.workflow.states import CalendarOutcome
+
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
 
@@ -24,6 +26,8 @@ class CalendarCreateResult:
     ok: bool
     html_link: str | None = None
     error: str | None = None
+    outcome: CalendarOutcome | None = None
+    event_id: str | None = None
 
 
 RequestJson = Callable[[str, dict, dict], dict]
@@ -42,15 +46,34 @@ class GoogleCalendarClient:
     def create_event(self, payload: dict) -> CalendarCreateResult:
         missing = self._missing_config()
         if missing:
-            return CalendarCreateResult(ok=False, error=f"Missing {', '.join(missing)}")
+            return CalendarCreateResult(
+                ok=False,
+                error=f"Missing {', '.join(missing)}",
+                outcome=CalendarOutcome.LINK_REQUIRED,
+            )
         try:
             token = self._refresh_access_token()
             calendar_id = quote(self.config.calendar_id or "primary", safe="")
             url = f"{CALENDAR_EVENTS_URL.format(calendar_id=calendar_id)}?sendUpdates=all"
             result = self._request_json(url, payload, {"Authorization": f"Bearer {token}"})
-            return CalendarCreateResult(ok=True, html_link=result.get("htmlLink"))
+            return CalendarCreateResult(
+                ok=True,
+                html_link=result.get("htmlLink"),
+                event_id=result.get("id"),
+                outcome=CalendarOutcome.CREATED,
+            )
+        except (TimeoutError, ConnectionError) as exc:
+            return CalendarCreateResult(
+                ok=False,
+                error=type(exc).__name__,
+                outcome=CalendarOutcome.UNKNOWN,
+            )
         except Exception as exc:
-            return CalendarCreateResult(ok=False, error=str(exc))
+            return CalendarCreateResult(
+                ok=False,
+                error=type(exc).__name__,
+                outcome=CalendarOutcome.FAILED,
+            )
 
     def _missing_config(self) -> list[str]:
         missing: list[str] = []

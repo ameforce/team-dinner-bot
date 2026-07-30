@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+import logging
+from uuid import uuid4
+
 from slack_bolt import App
 from sqlalchemy.orm import sessionmaker
 
@@ -20,10 +24,13 @@ from app.handlers.views import (
 from app.handlers.intent import dispatch_hoesik_intent
 from app.handlers.settings_modal_flow import open_settings_modal
 from app.integrations.slack_users import list_human_member_ids
+from app.rendering import post_rendered, render_settings_failed, render_settings_saved
 from app.schedule.spec import ScheduleSpec
 from app.settings_defaults import default_schedule_spec
 from app.scheduler.runner import JobScheduler
 from app.workflow.engine import WorkflowEngine
+
+logger = logging.getLogger(__name__)
 
 
 def register_command_handlers(
@@ -81,9 +88,9 @@ def register_command_handlers(
 
     @app.view("settings_submit")
     def on_settings_submit(ack, body, client, view):
-        ack()
         channel_id, schedule_draft = _settings_context(view)
         if not channel_id:
+            ack()
             return
         try:
             automatic_enabled = parse_automatic_execution_enabled(view)
@@ -97,7 +104,10 @@ def register_command_handlers(
                     poll_hours, booking_url = parse_non_schedule_settings_submission(view)
                     spec = schedule_spec_from_draft(schedule_draft) if schedule_draft else None
         except (ValueError, TypeError):
-            client.chat_postMessage(channel=channel_id, text=m.MSG_SETTINGS_INVALID)
+            ack(
+                response_action="errors",
+                errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+            )
             return
 
         team_id = _settings_team_id(body)
@@ -105,33 +115,63 @@ def register_command_handlers(
             repo = ChannelRepository(session)
             row = repo.get_by_channel_id(channel_id)
             if (not row or not row.team_id.strip()) and not team_id:
-                client.chat_postMessage(channel=channel_id, text=m.MSG_SETTINGS_INVALID)
+                ack(
+                    response_action="errors",
+                    errors={"automatic_execution": m.MSG_SETTINGS_INVALID},
+                )
                 return
             if spec is None:
                 spec = _existing_schedule_or_default(row)
 
-        current_member_ids = list_human_member_ids(client, channel_id)
-        with session_factory() as session:
-            repo = ChannelRepository(session)
-            repo.save_channel_settings(
-                channel_id,
-                team_id=team_id,
-                spec=spec,
-                poll_duration_hours=poll_hours,
-                booking_url=booking_url,
-                poll_target_ids=poll_target_ids,
-                calendar_invitees=calendar_invitees,
-                channel_member_ids=current_member_ids,
-                automatic_execution_enabled=automatic_enabled,
-            )
+        ack()
+        try:
+            current_member_ids = list_human_member_ids(client, channel_id)
+            with session_factory() as session:
+                repo = ChannelRepository(session)
+                repo.save_channel_settings(
+                    channel_id,
+                    team_id=team_id,
+                    spec=spec,
+                    poll_duration_hours=poll_hours,
+                    booking_url=booking_url,
+                    poll_target_ids=poll_target_ids,
+                    calendar_invitees=calendar_invitees,
+                    channel_member_ids=current_member_ids,
+                    automatic_execution_enabled=automatic_enabled,
+                )
+        except Exception:
+            correlation_id = uuid4().hex[:12]
+            logger.exception("settings save failed correlation_id=%s", correlation_id)
+            user_id = _settings_user_id(body)
+            if user_id:
+                post_rendered(
+                    client,
+                    channel_id,
+                    render_settings_failed(correlation_id),
+                    user=user_id,
+                )
+            return
 
+        sync = None
         if job_scheduler:
-            job_scheduler.schedule_channel(channel_id)
+            try:
+                sync = job_scheduler.schedule_channel(channel_id)
+            except Exception:
+                logger.exception("settings scheduler sync failed channel_id=%s", channel_id)
+        if engine:
+            engine.resume_channel(channel_id)
 
-        client.chat_postMessage(
-            channel=channel_id,
-            text=f"{m.MSG_SAVED} {spec.describe_ko()} (\ud22c\ud45c {poll_hours}\uc2dc\uac04)",
+        next_run = getattr(sync, "next_run", None)
+        if not isinstance(next_run, datetime):
+            next_run = None
+        rendered = render_settings_saved(
+            automatic_enabled=automatic_enabled,
+            schedule_description=spec.describe_ko(),
+            poll_duration_hours=poll_hours,
+            scheduler_applied=bool(sync and getattr(sync, "applied", False)),
+            next_run=next_run,
         )
+        post_rendered(client, channel_id, rendered)
 
 
 def _slash_channel_id(body: dict) -> str:
@@ -188,6 +228,16 @@ def _settings_team_id(body: dict) -> str:
         if isinstance(team_id, str):
             return team_id.strip()
     return ""
+
+
+def _settings_user_id(body: dict) -> str:
+    if not isinstance(body, dict):
+        return ""
+    user = body.get("user") or {}
+    if not isinstance(user, dict):
+        return ""
+    user_id = user.get("id")
+    return user_id.strip() if isinstance(user_id, str) else ""
 
 
 def _existing_schedule_or_default(row) -> ScheduleSpec:
