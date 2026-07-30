@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
+
 from slack_bolt import App
 from sqlalchemy.orm import sessionmaker
 
@@ -23,8 +25,11 @@ from app.handlers.views import (
     welcome_blocks,
 )
 from app.integrations.slack_users import list_human_member_ids
+from app.rendering import RenderedSlackMessage, post_rendered, render_welcome
 from app.scheduler.runner import JobScheduler
 from app.workflow.engine import WorkflowEngine
+
+logger = logging.getLogger(__name__)
 
 
 def register_event_handlers(
@@ -44,15 +49,29 @@ def register_event_handlers(
             return
 
         with session_factory() as session:
-            ChannelRepository(session).upsert_on_bot_join(
+            row = ChannelRepository(session).upsert_on_bot_join(
                 team_id=team_id or auth.get("team_id", ""),
                 channel_id=channel_id,
             )
 
-        client.chat_postMessage(
-            channel=channel_id,
-            text=m.WELCOME_TEXT,
-            blocks=welcome_blocks(),
+        try:
+            sync = job_scheduler.schedule_channel(channel_id) if job_scheduler else None
+        except Exception:
+            logger.exception("join scheduler sync failed channel_id=%s", channel_id)
+            sync = None
+        welcome = render_welcome(
+            scheduler_applied=bool(sync and sync.applied),
+            automatic_enabled=row.automatic_execution_enabled,
+        )
+        post_rendered(
+            client,
+            channel_id,
+            RenderedSlackMessage(
+                welcome.result_code,
+                welcome.audience,
+                welcome.text,
+                welcome_blocks(),
+            ),
         )
 
     @app.event("member_left_channel")
@@ -64,7 +83,10 @@ def register_event_handlers(
         with session_factory() as session:
             ChannelRepository(session).disable_channel(channel_id)
         if job_scheduler:
-            job_scheduler.schedule_channel(channel_id)
+            try:
+                job_scheduler.schedule_channel(channel_id)
+            except Exception:
+                logger.exception("leave scheduler removal failed channel_id=%s", channel_id)
 
     @app.action("open_settings")
     def open_settings(ack, body, client):
@@ -145,7 +167,7 @@ def register_event_handlers(
     def show_status(ack, body, client):
         ack()
         channel_id = body["channel"]["id"]
-        text = format_status(channel_id, session_factory)
+        text = format_status(channel_id, session_factory, job_scheduler)
         client.chat_postEphemeral(
             channel=channel_id,
             user=body["user"]["id"],

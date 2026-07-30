@@ -155,10 +155,10 @@ def format_tally_message(date_iso: str, counts: dict[str, int]) -> str:
     d = date.fromisoformat(date_iso)
     lines = [
         "*\ud22c\ud45c\uac00 \ub9c8\uac10\ub418\uc5c8\uc2b5\ub2c8\ub2e4.*\n"
-        f"\ud655\uc815 \ud6c4\ubcf4: *{format_date_ko(d)}* (`{date_iso}`)"
+        f"\ud655\uc815\uc77c: *{format_date_ko(d)}* (`{date_iso}`)"
     ]
     if counts:
-        lines.append("\n*\ub4dd\ud45c*")
-        for iso, n in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+        lines.append("\n*\ub0a0\uc9dc\ubcc4 \ubd88\uac00\ub2a5 \uc751\ub2f5*")
+        for iso, n in sorted(counts.items(), key=lambda x: (x[1], x[0])):
             lines.append(f"\u2022 {format_date_ko(date.fromisoformat(iso))}: {n}\uba85")
     return "\n".join(lines)

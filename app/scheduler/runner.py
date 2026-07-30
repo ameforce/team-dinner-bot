@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -10,14 +11,22 @@ from sqlalchemy.orm import sessionmaker
 from zoneinfo import ZoneInfo
 
 from app.config import settings
-from app.settings_defaults import clamp_poll_duration_hours
 from app.db.repository import ChannelRepository, WorkflowRepository
 from app.schedule.spec import ScheduleSpec
 from app.workflow.engine import WorkflowEngine
+from app.workflow.states import OutboundEffectStatus, OutboundEffectType
 
 logger = logging.getLogger(__name__)
 
 POLL_CLOSE_JOB_PREFIX = "poll_close_"
+
+
+@dataclass(frozen=True)
+class SchedulerSyncResult:
+    automatic_enabled: bool
+    applied: bool
+    next_run: datetime | None = None
+    error_code: str | None = None
 
 
 class JobScheduler:
@@ -29,6 +38,7 @@ class JobScheduler:
 
     def start(self) -> None:
         self.refresh_all()
+        self.engine.recover_pending_runs()
         self.reschedule_open_poll_closes()
         self.scheduler.start()
         logger.info("APScheduler started")
@@ -68,20 +78,14 @@ class JobScheduler:
                         ZoneInfo(ch.tz),
                     )
                     if deadline <= now:
-                        hours = clamp_poll_duration_hours(ch.poll_duration_hours)
-                        deadline = now + timedelta(hours=hours)
-                        with self.session_factory() as session:
-                            row = WorkflowRepository(session).get_run(run.id)
-                            if row:
-                                WorkflowRepository(session).update_run(
-                                    row, poll_deadline=deadline
-                                )
                         logger.warning(
-                            "poll_close run_id=%s had past deadline; rescheduled to %s",
+                            "poll_close run_id=%s overdue at %s; closing immediately",
                             run.id,
                             deadline,
                         )
-                    self.schedule_poll_close(run.id, deadline)
+                        self.engine.close_poll(run.id)
+                    else:
+                        self.schedule_poll_close(run.id, deadline)
 
     def refresh_all(self) -> None:
         with self.session_factory() as session:
@@ -89,7 +93,7 @@ class JobScheduler:
         for ch in channels:
             self.schedule_channel(ch.channel_id)
 
-    def schedule_channel(self, slack_channel_id: str) -> None:
+    def schedule_channel(self, slack_channel_id: str) -> SchedulerSyncResult:
         job_id = f"channel_run_{slack_channel_id}"
         for job in list(self.scheduler.get_jobs()):
             if job.id == job_id:
@@ -97,26 +101,99 @@ class JobScheduler:
 
         with self.session_factory() as session:
             ch = ChannelRepository(session).get_by_channel_id(slack_channel_id)
+            revision = ch.settings_revision if ch else 0
+            effect = WorkflowRepository(session).ensure_effect(
+                aggregate_type="channel",
+                aggregate_id=slack_channel_id,
+                effect_type=OutboundEffectType.SCHEDULER_SYNC,
+                idempotency_key=f"channel:{slack_channel_id}:scheduler:{revision}:v1",
+            )
             if (
                 not ch
                 or not ch.schedule_json
                 or not ch.enabled
                 or not ch.automatic_execution_enabled
             ):
-                return
+                applied = self.scheduler.get_job(job_id) is None
+                WorkflowRepository(session).update_effect(
+                    effect,
+                    status=(
+                        OutboundEffectStatus.SENT
+                        if applied
+                        else OutboundEffectStatus.FAILED
+                    ),
+                    error_code=None if applied else "SCHEDULER_REMOVE_FAILED",
+                    increment_attempt=True,
+                )
+                return SchedulerSyncResult(
+                    automatic_enabled=bool(ch and ch.automatic_execution_enabled),
+                    applied=applied,
+                    error_code=None if applied else "SCHEDULER_REMOVE_FAILED",
+                )
             spec = ScheduleSpec.model_validate_json(ch.schedule_json)
             tz = ZoneInfo(ch.tz)
             next_run = spec.next_run_after(datetime.now(tz), ch.tz)
 
-        self.scheduler.add_job(
-            self._trigger_run,
-            trigger=DateTrigger(run_date=next_run),
-            id=job_id,
-            kwargs={"slack_channel_id": slack_channel_id},
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
+        try:
+            self.scheduler.add_job(
+                self._trigger_run,
+                trigger=DateTrigger(run_date=next_run),
+                id=job_id,
+                kwargs={"slack_channel_id": slack_channel_id},
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+            read_back = self.scheduler.get_job(job_id)
+            read_back_next = getattr(read_back, "next_run_time", None)
+            applied = bool(
+                read_back
+                and (read_back_next is None or read_back_next == next_run)
+            )
+        except Exception:
+            logger.exception("Failed to synchronize scheduler job %s", job_id)
+            applied = False
+            read_back = None
+            read_back_next = None
+        with self.session_factory() as session:
+            effect = WorkflowRepository(session).get_effect(
+                "channel", slack_channel_id, OutboundEffectType.SCHEDULER_SYNC
+            )
+            if effect:
+                WorkflowRepository(session).update_effect(
+                    effect,
+                    status=(
+                        OutboundEffectStatus.SENT
+                        if applied
+                        else OutboundEffectStatus.FAILED
+                    ),
+                    remote_ref=job_id if applied else None,
+                    error_code=None if applied else "SCHEDULER_SYNC_FAILED",
+                    increment_attempt=True,
+                )
         logger.info("Scheduled %s at %s", job_id, next_run)
+        return SchedulerSyncResult(
+            automatic_enabled=True,
+            applied=applied,
+            next_run=(read_back_next or next_run) if read_back and applied else None,
+            error_code=None if applied else "SCHEDULER_SYNC_FAILED",
+        )
+
+    def read_channel(self, slack_channel_id: str) -> SchedulerSyncResult:
+        job_id = f"channel_run_{slack_channel_id}"
+        with self.session_factory() as session:
+            ch = ChannelRepository(session).get_by_channel_id(slack_channel_id)
+        if not ch or not ch.enabled or not ch.automatic_execution_enabled:
+            return SchedulerSyncResult(
+                automatic_enabled=bool(ch and ch.automatic_execution_enabled),
+                applied=self.scheduler.get_job(job_id) is None,
+            )
+        job = self.scheduler.get_job(job_id)
+        return SchedulerSyncResult(
+            automatic_enabled=True,
+            applied=job is not None,
+            next_run=getattr(job, "next_run_time", None) if job else None,
+            error_code=None if job else "SCHEDULER_JOB_MISSING",
+        )
 
     def schedule_poll_close(self, run_id: int, deadline: datetime) -> None:
         tz = ZoneInfo(settings.default_timezone)
