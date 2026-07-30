@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+from hashlib import sha256
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -22,6 +23,19 @@ from app.integrations.calendar_links import (
     build_google_calendar_url,
 )
 from app.integrations.google_calendar import GoogleCalendarClient, GoogleCalendarConfig
+from app.rendering import (
+    MessageAudience,
+    RenderedSlackMessage,
+    ResultCode,
+    post_rendered,
+    render_assignee_dm,
+    render_assignee_public,
+    render_assignee_unavailable,
+    render_booking_done,
+    render_poll_open,
+    render_poll_result,
+    update_rendered,
+)
 from app.integrations.slack_users import (
     collect_attendee_emails,
     list_human_member_ids,
@@ -31,7 +45,6 @@ from app.settings_defaults import clamp_poll_duration_hours
 from app.workflow.dates import business_days_rest_of_month
 from app.workflow.poll import (
     choose_dinner_date_with_pool,
-    format_tally_message,
     poll_blocks,
     tally_votes_with_pool,
     winning_option_json,
@@ -43,10 +56,16 @@ from app.workflow.participants import (
     resolve_calendar_invitees,
     resolve_poll_target_ids,
 )
-from app.workflow.states import WorkflowState
+from app.workflow.states import (
+    CalendarOutcome,
+    OutboundEffectStatus,
+    OutboundEffectType,
+    WorkflowState,
+)
 
 logger = logging.getLogger(__name__)
 SELECTION_AUDIT_SCHEMA_VERSION = 1
+MAX_ASSIGNEE_DM_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -117,18 +136,239 @@ class WorkflowEngine:
             return deadline.replace(tzinfo=tz)
         return deadline.astimezone(tz)
 
-    def _abort_open_runs(self, channel_db_id: int) -> list[int]:
-        """Silently end stale POLL_OPEN runs (no Slack posts)."""
-        aborted: list[int] = []
+    def _abort_active_run(self, channel_db_id: int) -> int | None:
         with self.session_factory() as session:
             wf = WorkflowRepository(session)
-            for run in wf.list_open_runs(channel_db_id):
-                wf.update_run(run, state=WorkflowState.DONE)
-                aborted.append(run.id)
-        for run_id in aborted:
-            if self._cancel_poll_close:
-                self._cancel_poll_close(run_id)
-        return aborted
+            run = wf.get_active_run(channel_db_id)
+            if not run:
+                return None
+            run_id = run.id
+            wf.update_run(
+                run,
+                state=WorkflowState.DONE,
+                terminal_reason="REPLACED",
+            )
+        if self._cancel_poll_close:
+            self._cancel_poll_close(run_id)
+        return run_id
+
+    @staticmethod
+    def _is_ambiguous_failure(exc: Exception) -> bool:
+        return isinstance(exc, (TimeoutError, ConnectionError))
+
+    def _post_effect(
+        self,
+        *,
+        run_id: int,
+        effect_type: OutboundEffectType,
+        channel: str,
+        message: RenderedSlackMessage,
+        thread_ts: str | None = None,
+        metadata: dict | None = None,
+    ) -> bool:
+        with self.session_factory() as session:
+            wf = WorkflowRepository(session)
+            effect = wf.get_effect("workflow_run", str(run_id), effect_type)
+            if not effect:
+                effect = wf.ensure_effect(
+                    aggregate_type="workflow_run",
+                    aggregate_id=str(run_id),
+                    effect_type=effect_type,
+                    idempotency_key=(
+                        f"run:{run_id}:{effect_type.value.lower().replace('_', '-')}:v1"
+                    ),
+                )
+            if effect.status == OutboundEffectStatus.SENT:
+                return True
+            if effect.status == OutboundEffectStatus.UNKNOWN:
+                return False
+            if (
+                effect.status == OutboundEffectStatus.PENDING
+                and effect.attempt_count > 0
+            ):
+                wf.update_effect(
+                    effect,
+                    status=OutboundEffectStatus.UNKNOWN,
+                    error_code="DELIVERY_UNRESOLVED",
+                )
+                return False
+            wf.update_effect(
+                effect,
+                status=OutboundEffectStatus.PENDING,
+                increment_attempt=True,
+            )
+        kwargs: dict[str, Any] = {}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        if metadata:
+            kwargs["metadata"] = metadata
+        try:
+            response = post_rendered(self.client, channel, message, **kwargs)
+        except Exception as exc:
+            status = (
+                OutboundEffectStatus.UNKNOWN
+                if self._is_ambiguous_failure(exc)
+                else OutboundEffectStatus.FAILED
+            )
+            with self.session_factory() as session:
+                wf = WorkflowRepository(session)
+                effect = wf.get_effect("workflow_run", str(run_id), effect_type)
+                if effect:
+                    wf.update_effect(
+                        effect,
+                        status=status,
+                        error_code=type(exc).__name__,
+                    )
+            logger.exception("outbound effect failed run_id=%s type=%s", run_id, effect_type)
+            return False
+        remote_ref = response.get("ts") if isinstance(response, dict) else None
+        with self.session_factory() as session:
+            wf = WorkflowRepository(session)
+            effect = wf.get_effect("workflow_run", str(run_id), effect_type)
+            if effect:
+                wf.update_effect(
+                    effect,
+                    status=OutboundEffectStatus.SENT,
+                    remote_ref=remote_ref,
+                )
+        return True
+
+    def _post_open_poll(self, run_id: int, slack_channel_id: str) -> bool:
+        with self.session_factory() as session:
+            wf = WorkflowRepository(session)
+            run = wf.get_run(run_id)
+            if not run or run.state != WorkflowState.POLL_STARTING:
+                return bool(run and run.state == WorkflowState.POLL_OPEN)
+            ch = session.get(Channel, run.channel_id)
+            if not ch:
+                return False
+            candidates = _candidate_dates(run, ch)
+            deadline = self._normalize_deadline(
+                run.poll_deadline or datetime.now(ZoneInfo(ch.tz)), ZoneInfo(ch.tz)
+            )
+            target_member_ids = _target_member_ids_for_run(run)
+            effect = wf.get_effect(
+                "workflow_run", str(run.id), OutboundEffectType.POLL_OPEN_MESSAGE
+            )
+            if not effect:
+                return False
+            if effect.status == OutboundEffectStatus.UNKNOWN:
+                wf.update_run(
+                    run,
+                    state=WorkflowState.NEEDS_ATTENTION,
+                    attention_reason="POLL_POST_UNKNOWN",
+                    result_code="POLL_POST_UNKNOWN",
+                )
+                return False
+            if (
+                effect.status == OutboundEffectStatus.PENDING
+                and effect.attempt_count > 0
+            ):
+                wf.update_run(
+                    run,
+                    state=WorkflowState.NEEDS_ATTENTION,
+                    attention_reason="POLL_POST_UNRESOLVED",
+                    result_code="POLL_POST_UNRESOLVED",
+                )
+                return False
+            if effect.status == OutboundEffectStatus.SENT and effect.remote_ref:
+                wf.update_run(
+                    run,
+                    state=WorkflowState.POLL_OPEN,
+                    thread_ts=effect.remote_ref,
+                )
+                return True
+            wf.update_effect(
+                effect,
+                status=OutboundEffectStatus.PENDING,
+                increment_attempt=True,
+            )
+        message = render_poll_open(
+            blocks=poll_blocks(
+                run_id,
+                candidates,
+                deadline,
+                target_user_ids=target_member_ids,
+                unavailable_by_user={},
+            )
+        )
+        try:
+            response = post_rendered(
+                self.client,
+                slack_channel_id,
+                message,
+                metadata={
+                    "event_type": "team_dinner_poll",
+                    "event_payload": {"run_id": str(run_id)},
+                },
+            )
+        except Exception as exc:
+            ambiguous = self._is_ambiguous_failure(exc)
+            with self.session_factory() as session:
+                wf = WorkflowRepository(session)
+                run = wf.get_run(run_id)
+                effect = wf.get_effect(
+                    "workflow_run", str(run_id), OutboundEffectType.POLL_OPEN_MESSAGE
+                )
+                if run and effect:
+                    wf.transition_with_effect(
+                        run,
+                        effect,
+                        effect_status=(
+                            OutboundEffectStatus.UNKNOWN
+                            if ambiguous
+                            else OutboundEffectStatus.FAILED
+                        ),
+                        error_code=type(exc).__name__,
+                        state=(
+                            WorkflowState.NEEDS_ATTENTION
+                            if ambiguous
+                            else WorkflowState.FAILED
+                        ),
+                        attention_reason="POLL_POST_UNKNOWN" if ambiguous else None,
+                        terminal_reason=None if ambiguous else "POLL_POST_FAILED",
+                        result_code="POLL_POST_UNKNOWN" if ambiguous else "POLL_POST_FAILED",
+                    )
+            logger.exception("poll post failed run_id=%s", run_id)
+            return False
+        thread_ts = response.get("ts") if isinstance(response, dict) else None
+        if not thread_ts:
+            with self.session_factory() as session:
+                wf = WorkflowRepository(session)
+                run = wf.get_run(run_id)
+                effect = wf.get_effect(
+                    "workflow_run", str(run_id), OutboundEffectType.POLL_OPEN_MESSAGE
+                )
+                if run and effect:
+                    wf.transition_with_effect(
+                        run,
+                        effect,
+                        effect_status=OutboundEffectStatus.UNKNOWN,
+                        error_code="SLACK_TS_MISSING",
+                        state=WorkflowState.NEEDS_ATTENTION,
+                        attention_reason="POLL_POST_UNKNOWN",
+                        result_code="POLL_POST_UNKNOWN",
+                    )
+            return False
+        with self.session_factory() as session:
+            wf = WorkflowRepository(session)
+            run = wf.get_run(run_id)
+            effect = wf.get_effect(
+                "workflow_run", str(run_id), OutboundEffectType.POLL_OPEN_MESSAGE
+            )
+            if not run or not effect:
+                return False
+            wf.transition_with_effect(
+                run,
+                effect,
+                effect_status=OutboundEffectStatus.SENT,
+                remote_ref=thread_ts,
+                state=WorkflowState.POLL_OPEN,
+                thread_ts=thread_ts,
+            )
+        if self._schedule_poll_close:
+            self._schedule_poll_close(run_id, deadline)
+        return True
 
     def start_channel_run(self, slack_channel_id: str, *, replace: bool = False) -> str | None:
         with self.session_factory() as session:
@@ -138,10 +378,10 @@ class WorkflowEngine:
             if not ch.schedule_json:
                 return m.MSG_NO_SCHEDULE
             wf = WorkflowRepository(session)
-            if wf.get_open_run(ch.id):
+            if wf.get_active_run(ch.id):
                 if not replace:
                     return m.MSG_POLL_ALREADY_OPEN
-                self._abort_open_runs(ch.id)
+                self._abort_active_run(ch.id)
             tz = ZoneInfo(ch.tz)
             now = datetime.now(tz)
             candidates = business_days_rest_of_month(after=now, tz_name=ch.tz)
@@ -155,13 +395,6 @@ class WorkflowEngine:
                 now + timedelta(hours=poll_hours),
                 tz,
             )
-            run = wf.create_run(
-                ch.id,
-                state=WorkflowState.POLL_OPEN,
-                scheduled_for=now,
-                poll_deadline=deadline,
-            )
-
         members = list_human_members(self.client, slack_channel_id)
         current_member_ids = [member.user_id for member in members]
         if has_configured_poll_targets or known_member_ids:
@@ -177,32 +410,23 @@ class WorkflowEngine:
             ensure_ascii=False,
         )
         with self.session_factory() as session:
-            run = WorkflowRepository(session).get_run(run.id)
-            if run:
-                WorkflowRepository(session).update_run(
-                    run,
-                    target_member_ids_json=target_member_ids_json,
-                )
-        blocks = poll_blocks(
-            run.id,
-            candidates,
-            deadline,
-            target_user_ids=target_member_ids,
-            unavailable_by_user={},
-        )
-        resp = self.client.chat_postMessage(
-            channel=slack_channel_id,
-            text=m.MSG_POLL_STARTED,
-            blocks=blocks,
-        )
-        thread_ts = resp.get("ts")
-        with self.session_factory() as session:
-            run = WorkflowRepository(session).get_run(run.id)
-            if run:
-                WorkflowRepository(session).update_run(run, thread_ts=thread_ts)
-        if self._schedule_poll_close:
-            self._schedule_poll_close(run.id, deadline)
-        return None
+            ch = ChannelRepository(session).get_by_channel_id(slack_channel_id)
+            if not ch or not ch.enabled:
+                return m.MSG_CHANNEL_DISABLED
+            run = WorkflowRepository(session).create_claimed_run(
+                ch.id,
+                state=WorkflowState.POLL_STARTING,
+                scheduled_for=now,
+                poll_deadline=deadline,
+                target_member_ids_json=target_member_ids_json,
+                poll_semantics="unavailable",
+                initial_effect_type=OutboundEffectType.POLL_OPEN_MESSAGE,
+            )
+        if not run:
+            return m.MSG_POLL_ALREADY_OPEN
+        if self._post_open_poll(run.id, slack_channel_id):
+            return None
+        return m.MSG_POLL_START_FAILED
 
     def cancel_current_run(self, slack_channel_id: str) -> str:
         with self.session_factory() as session:
@@ -215,13 +439,27 @@ class WorkflowEngine:
                 return m.MSG_NO_ACTIVE_RUN
             run_id = run.id
             thread_ts = run.thread_ts
-            wf.update_run(run, state=WorkflowState.DONE)
+            terminal_reason = (
+                "CANCELLED_NO_ASSIGNEE"
+                if run.attention_reason == "NO_ASSIGNEE_AVAILABLE"
+                else "CANCELLED"
+            )
+            wf.update_run(
+                run,
+                state=WorkflowState.DONE,
+                terminal_reason=terminal_reason,
+            )
         if self._cancel_poll_close:
             self._cancel_poll_close(run_id)
-        self.client.chat_postMessage(
-            channel=slack_channel_id,
+        post_rendered(
+            self.client,
+            slack_channel_id,
+            RenderedSlackMessage(
+                ResultCode.OPERATION_FAILED,
+                MessageAudience.PUBLIC,
+                m.MSG_RUN_CANCELLED,
+            ),
             thread_ts=thread_ts,
-            text=m.MSG_RUN_CANCELLED,
         )
         return m.MSG_RUN_CANCELLED
 
@@ -240,16 +478,20 @@ class WorkflowEngine:
             target_member_ids = _target_member_ids_for_run(run)
             thread_ts = run.thread_ts
         if thread_ts and hasattr(self.client, "chat_update"):
-            self.client.chat_update(
-                channel=channel_id,
-                ts=thread_ts,
-                text=m.MSG_POLL_STARTED,
-                blocks=poll_blocks(
-                    run_id,
-                    candidates,
-                    self._normalize_deadline(run.poll_deadline or datetime.now(), ZoneInfo(ch.tz)),
-                    target_user_ids=target_member_ids,
-                    unavailable_by_user=votes,
+            update_rendered(
+                self.client,
+                channel_id,
+                thread_ts,
+                render_poll_open(
+                    blocks=poll_blocks(
+                        run_id,
+                        candidates,
+                        self._normalize_deadline(
+                            run.poll_deadline or datetime.now(), ZoneInfo(ch.tz)
+                        ),
+                        target_user_ids=target_member_ids,
+                        unavailable_by_user=votes,
+                    )
                 ),
             )
         return PollVoteResult.success(added=added)
@@ -260,79 +502,255 @@ class WorkflowEngine:
         with self.session_factory() as session:
             wf = WorkflowRepository(session)
             run = wf.get_run(run_id)
-            if not run or run.state != WorkflowState.POLL_OPEN:
+            if not run:
                 return
-            ch = session.get(Channel, run.channel_id)
-            if not ch:
+            if run.state == WorkflowState.CLOSE_COMPUTED:
+                ch = session.get(Channel, run.channel_id)
+                if not ch:
+                    return
+                slack_channel_id = ch.channel_id
+                thread_ts = run.thread_ts
+            elif run.state != WorkflowState.POLL_OPEN:
                 return
-            candidate_isos = _candidate_date_iso_list(run, ch)
-            votes = _filter_votes_to_candidates(wf.votes_by_user(run_id), set(candidate_isos))
-            if run.poll_semantics == "unavailable":
-                winner, counts, date_selection_pool = choose_dinner_date_with_pool(
-                    votes,
-                    candidate_isos,
-                    choose=random.choice,
-                )
             else:
-                winner, counts, date_selection_pool = tally_votes_with_pool(votes)
-            if not winner:
-                self.client.chat_postMessage(
-                    channel=ch.channel_id,
-                    thread_ts=run.thread_ts,
-                    text=m.MSG_NO_VOTES_SKIP,
+                ch = session.get(Channel, run.channel_id)
+                if not ch:
+                    return
+                candidate_isos = _candidate_date_iso_list(run, ch)
+                votes = _filter_votes_to_candidates(
+                    wf.votes_by_user(run_id), set(candidate_isos)
                 )
-                wf.update_run(run, state=WorkflowState.DONE)
-                return
-            wf.update_run(
-                run,
-                state=WorkflowState.POLL_CLOSED,
-                winning_option_json=winning_option_json(winner, counts),
-                selection_audit_json=_merge_selection_audit(
-                    run.selection_audit_json,
-                    date=_date_audit_payload(
-                        candidate_pool=candidate_isos,
-                        selection_pool=date_selection_pool,
-                        selected=winner,
-                        counts=counts,
-                        poll_semantics=run.poll_semantics,
+                if run.poll_semantics == "unavailable":
+                    winner, counts, date_selection_pool = choose_dinner_date_with_pool(
+                        votes,
+                        candidate_isos,
+                        choose=random.choice,
+                    )
+                else:
+                    winner, counts, date_selection_pool = tally_votes_with_pool(votes)
+                if not winner:
+                    wf.update_run(
+                        run,
+                        state=WorkflowState.DONE,
+                        terminal_reason="NO_VOTES",
+                    )
+                    post_rendered(
+                        self.client,
+                        ch.channel_id,
+                        RenderedSlackMessage(
+                            ResultCode.OPERATION_FAILED,
+                            MessageAudience.PUBLIC,
+                            m.MSG_NO_VOTES_SKIP,
+                        ),
+                        thread_ts=run.thread_ts,
+                    )
+                    return
+                wf.update_run(
+                    run,
+                    state=WorkflowState.CLOSE_COMPUTED,
+                    winning_option_json=winning_option_json(winner, counts),
+                    selection_audit_json=_merge_selection_audit(
+                        run.selection_audit_json,
+                        date=_date_audit_payload(
+                            candidate_pool=candidate_isos,
+                            selection_pool=date_selection_pool,
+                            selected=winner,
+                            counts=counts,
+                            poll_semantics=run.poll_semantics,
+                        ),
                     ),
-                ),
-            )
-            logger.info(
-                "date_selection_audit run_id=%s channel_id=%s selected=%s",
-                run.id,
-                ch.channel_id,
-                winner,
-            )
-            slack_channel_id = ch.channel_id
-            thread_ts = run.thread_ts
-            poll_closed_run = run
+                )
+                wf.ensure_effect(
+                    aggregate_type="workflow_run",
+                    aggregate_id=str(run.id),
+                    effect_type=OutboundEffectType.POLL_RESULT_NOTICE,
+                    idempotency_key=f"run:{run.id}:poll-result:v1",
+                )
+                logger.info(
+                    "date_selection_audit run_id=%s channel_id=%s selected=%s",
+                    run.id,
+                    ch.channel_id,
+                    winner,
+                )
+                slack_channel_id = ch.channel_id
+                thread_ts = run.thread_ts
+        self._deliver_poll_result(run_id, slack_channel_id, thread_ts)
 
-        self.client.chat_postMessage(
+    def _deliver_poll_result(
+        self, run_id: int, slack_channel_id: str, thread_ts: str | None
+    ) -> None:
+        with self.session_factory() as session:
+            run = WorkflowRepository(session).get_run(run_id)
+            if not run or not run.winning_option_json:
+                return
+            winner_payload = json.loads(run.winning_option_json)
+            winner = winner_payload["date"]
+            counts = winner_payload.get("counts", {})
+        delivered = self._post_effect(
+            run_id=run_id,
+            effect_type=OutboundEffectType.POLL_RESULT_NOTICE,
             channel=slack_channel_id,
             thread_ts=thread_ts,
-            text=format_tally_message(winner, counts),
+            message=render_poll_result(winner, counts),
+            metadata={
+                "event_type": "team_dinner_poll_result",
+                "event_payload": {"run_id": str(run_id)},
+            },
         )
-        self._assign_booking(poll_closed_run.id, slack_channel_id, thread_ts)
+        if delivered:
+            self._assign_booking(run_id, slack_channel_id, thread_ts)
+            return
+        with self.session_factory() as session:
+            wf = WorkflowRepository(session)
+            run = wf.get_run(run_id)
+            effect = wf.get_effect(
+                "workflow_run", str(run_id), OutboundEffectType.POLL_RESULT_NOTICE
+            )
+            if run and effect and effect.status == OutboundEffectStatus.UNKNOWN:
+                wf.update_run(
+                    run,
+                    state=WorkflowState.NEEDS_ATTENTION,
+                    attention_reason="POLL_RESULT_UNKNOWN",
+                    result_code="POLL_RESULT_UNKNOWN",
+                )
 
     def _assign_booking(self, run_id: int, slack_channel_id: str, thread_ts: str | None) -> None:
         with self.session_factory() as session:
             wf = WorkflowRepository(session)
             run = wf.get_run(run_id)
-            if not run:
-                return
-            if run.state in (WorkflowState.DONE, WorkflowState.BOOKING_ASSIGNED):
+            if not run or run.state in (WorkflowState.DONE, WorkflowState.FAILED):
                 return
             ch = session.get(Channel, run.channel_id)
             if not ch:
                 return
-            target_member_ids = _target_member_ids_for_run(run)
-            if target_member_ids:
-                members = target_member_ids
-                member_source = "target_member_snapshot"
+            if run.state == WorkflowState.NEEDS_ATTENTION:
+                if run.attention_reason != "NO_ASSIGNEE_AVAILABLE":
+                    return
+                configured = ids_from_json(ch.poll_target_ids_json)
+                members = configured or list_human_member_ids(
+                    self.client, slack_channel_id
+                )
+                if not members:
+                    return
+                run.target_member_ids_json = json.dumps(members, ensure_ascii=False)
+                run.state = WorkflowState.CLOSE_COMPUTED
+                run.attention_reason = None
+                run.result_code = None
+                session.commit()
+            if run.state == WorkflowState.CLOSE_COMPUTED:
+                target_member_ids = _target_member_ids_for_run(run)
+                if target_member_ids:
+                    members = target_member_ids
+                    member_source = "target_member_snapshot"
+                else:
+                    members = list_human_member_ids(self.client, slack_channel_id)
+                    member_source = "current_channel_members"
+                last = wf.last_assignee(ch.id)
+                pool = [user for user in members if user != last] or members
+                if not pool:
+                    wf.update_run(
+                        run,
+                        state=WorkflowState.NEEDS_ATTENTION,
+                        attention_reason="NO_ASSIGNEE_AVAILABLE",
+                        result_code="ASSIGNEE_UNAVAILABLE",
+                    )
+                    wf.ensure_effect(
+                        aggregate_type="workflow_run",
+                        aggregate_id=str(run.id),
+                        effect_type=OutboundEffectType.ASSIGNEE_PUBLIC_NOTICE,
+                        idempotency_key=f"run:{run.id}:assignee-unavailable:v1",
+                    )
+                    notify = True
+                else:
+                    assignee = random.choice(pool)
+                    wf.update_run(
+                        run,
+                        state=WorkflowState.ASSIGNEE_SELECTED,
+                        assignee_user_id=assignee,
+                        selection_audit_json=_merge_selection_audit(
+                            run.selection_audit_json,
+                            assignee=_assignee_audit_payload(
+                                member_source=member_source,
+                                target_member_ids=members,
+                                previous_assignee=last,
+                                candidate_pool=pool,
+                                selected=assignee,
+                            ),
+                        ),
+                    )
+                    for effect_type, suffix in (
+                        (OutboundEffectType.ASSIGNEE_DM, "assignee-dm"),
+                        (OutboundEffectType.ASSIGNEE_PUBLIC_NOTICE, "assignee-public"),
+                    ):
+                        wf.ensure_effect(
+                            aggregate_type="workflow_run",
+                            aggregate_id=str(run.id),
+                            effect_type=effect_type,
+                            idempotency_key=f"run:{run.id}:{suffix}:v1",
+                        )
+                    logger.info(
+                        "assignee_selection_audit run_id=%s channel_id=%s selected=%s",
+                        run.id,
+                        slack_channel_id,
+                        assignee,
+                    )
+                    notify = False
             else:
-                members = list_human_member_ids(self.client, slack_channel_id)
-                member_source = "current_channel_members"
+                notify = False
+        if notify:
+            self._post_effect(
+                run_id=run_id,
+                effect_type=OutboundEffectType.ASSIGNEE_PUBLIC_NOTICE,
+                channel=slack_channel_id,
+                thread_ts=thread_ts,
+                message=render_assignee_unavailable(),
+            )
+            return
+        self._deliver_assignee(run_id, slack_channel_id, thread_ts)
+
+    def _calendar_details(
+        self, run_id: int, slack_channel_id: str
+    ) -> tuple[CalendarOutcome, str | None, str | None]:
+        with self.session_factory() as session:
+            wf = WorkflowRepository(session)
+            run = wf.get_run(run_id)
+            if not run:
+                return CalendarOutcome.FAILED, None, None
+            ch = session.get(Channel, run.channel_id)
+            if not ch or not run.winning_option_json:
+                return CalendarOutcome.FAILED, None, None
+            if run.calendar_outcome:
+                return (
+                    CalendarOutcome(run.calendar_outcome),
+                    run.calendar_html_link,
+                    run.calendar_operation_id,
+                )
+            operation_id = run.calendar_operation_id or (
+                "tdb" + sha256(f"team-dinner:{run.id}".encode()).hexdigest()[:24]
+            )
+            wf.update_run(run, calendar_operation_id=operation_id)
+            effect = wf.ensure_effect(
+                aggregate_type="workflow_run",
+                aggregate_id=str(run.id),
+                effect_type=OutboundEffectType.CALENDAR_CREATE,
+                idempotency_key=f"calendar:{operation_id}:v1",
+            )
+            if effect.status == OutboundEffectStatus.UNKNOWN:
+                wf.update_run(run, calendar_outcome=CalendarOutcome.UNKNOWN)
+                return CalendarOutcome.UNKNOWN, None, None
+            if (
+                effect.status == OutboundEffectStatus.PENDING
+                and effect.attempt_count > 0
+            ):
+                wf.transition_with_effect(
+                    run,
+                    effect,
+                    effect_status=OutboundEffectStatus.UNKNOWN,
+                    error_code="CALENDAR_DELIVERY_UNRESOLVED",
+                    calendar_outcome=CalendarOutcome.UNKNOWN,
+                    result_code="CALENDAR_RESULT_UNKNOWN",
+                )
+                return CalendarOutcome.UNKNOWN, None, operation_id
             current_member_ids = list_human_member_ids(self.client, slack_channel_id)
             calendar_invitees = _calendar_invitees_for_channel(ch, current_member_ids)
             required_slack_ids = [
@@ -348,112 +766,207 @@ class WorkflowEngine:
             emails, missing_member_ids = collect_attendee_emails(
                 session, self.client, required_slack_ids
             )
-            optional_emails, optional_missing_member_ids = collect_attendee_emails(
+            optional_emails, optional_missing = collect_attendee_emails(
                 session, self.client, optional_slack_ids
             )
-            missing_member_ids.extend(optional_missing_member_ids)
-            last = wf.last_assignee(ch.id)
-            pool = [u for u in members if u != last] or members
-            if not pool:
-                self.client.chat_postMessage(
-                    channel=slack_channel_id,
-                    thread_ts=thread_ts,
-                    text=m.MSG_NO_ASSIGNEE,
-                )
-                return
-            assignee = random.choice(pool)
-            wf.update_run(
-                run,
-                state=WorkflowState.BOOKING_ASSIGNED,
-                assignee_user_id=assignee,
-                selection_audit_json=_merge_selection_audit(
-                    run.selection_audit_json,
-                    assignee=_assignee_audit_payload(
-                        member_source=member_source,
-                        target_member_ids=members,
-                        previous_assignee=last,
-                        candidate_pool=pool,
-                        selected=assignee,
-                    ),
-                ),
-            )
-            logger.info(
-                "assignee_selection_audit run_id=%s channel_id=%s selected=%s",
-                run.id,
-                slack_channel_id,
-                assignee,
-            )
-            wf.record_assignee(ch.id, assignee)
+            missing_member_ids.extend(optional_missing)
+            winner = json.loads(run.winning_option_json)
             booking_url = ch.booking_url_template or m.MSG_BOOKING_URL_MISSING
-            winner = {}
-            if run.winning_option_json:
-                winner = json.loads(run.winning_option_json)
-            tz_name = ch.tz
-
-        date_label = winner.get("date", "?")
-        calendar_url = None
-        calendar_create_error = None
-        try:
             event = DinnerCalendarEvent(
                 title=f"{m.BOT_NAME} 회식",
-                dinner_date=date.fromisoformat(date_label),
-                tz_name=tz_name,
+                dinner_date=date.fromisoformat(winner["date"]),
+                tz_name=ch.tz,
                 booking_url=None if booking_url == m.MSG_BOOKING_URL_MISSING else booking_url,
                 attendee_emails=emails,
                 optional_attendee_emails=optional_emails,
                 missing_member_ids=missing_member_ids,
             )
-            create_result = self.calendar_client.create_event(
-                build_google_calendar_event_payload(event)
+            payload = build_google_calendar_event_payload(event)
+            payload["id"] = operation_id
+            fallback_url = build_google_calendar_url(event)
+            wf.update_effect(
+                effect,
+                status=OutboundEffectStatus.PENDING,
+                increment_attempt=True,
             )
-            if create_result.ok and create_result.html_link:
-                calendar_url = create_result.html_link
-            else:
-                calendar_create_error = create_result.error
-                calendar_url = build_google_calendar_url(event)
-        except ValueError:
-            logger.exception("Invalid winning date for calendar link: %s", date_label)
-        calendar_line = (
-            f"Google 캘린더 등록: {calendar_url}\n"
-            if calendar_url
-            else "Google 캘린더 등록: 확정 날짜를 확인할 수 없어 링크를 만들지 못했습니다.\n"
+        create_result = self.calendar_client.create_event(payload)
+        outcome = create_result.outcome or (
+            CalendarOutcome.CREATED if create_result.ok else CalendarOutcome.FAILED
         )
-        if calendar_create_error:
-            calendar_line = f"Google 캘린더 직접 생성 실패: {calendar_create_error}\n{calendar_line}"
-        dm_text = (
-            f"{m.MSG_BOOKING_DM_TITLE}\n"
-            f"\ud655\uc815 \ud6c4\ubcf4\uc77c: `{date_label}`\n"
-            f"\uc608\uc57d \ub9c1\ud06c: {booking_url}\n"
-            f"{calendar_line}"
-            "\uc608\uc57d \uc644\ub8cc \ud6c4 \uc544\ub798 \ubc84\ud2bc\uc744 \ub20c\ub7ec \uc8fc\uc138\uc694."
-        )
-        try:
-            self.client.chat_postMessage(
-                channel=assignee,
-                text=dm_text,
-                blocks=[
-                    {"type": "section", "text": {"type": "mrkdwn", "text": dm_text}},
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "text": {"type": "plain_text", "text": m.MSG_BOOKING_DONE_BTN},
-                                "style": "primary",
-                                "action_id": "booking_done",
-                                "value": str(run_id),
-                            }
-                        ],
-                    },
-                ],
+        if outcome == CalendarOutcome.CREATED:
+            calendar_url = create_result.html_link
+            effect_status = OutboundEffectStatus.SENT
+            error_code = None
+        elif outcome == CalendarOutcome.LINK_REQUIRED:
+            calendar_url = fallback_url
+            effect_status = OutboundEffectStatus.FAILED
+            error_code = "CALENDAR_CONFIG_MISSING"
+        elif outcome == CalendarOutcome.UNKNOWN:
+            calendar_url = None
+            effect_status = OutboundEffectStatus.UNKNOWN
+            error_code = "CALENDAR_RESULT_UNKNOWN"
+        else:
+            calendar_url = fallback_url
+            effect_status = OutboundEffectStatus.FAILED
+            error_code = "CALENDAR_CREATE_FAILED"
+        with self.session_factory() as session:
+            wf = WorkflowRepository(session)
+            run = wf.get_run(run_id)
+            effect = wf.get_effect(
+                "workflow_run", str(run_id), OutboundEffectType.CALENDAR_CREATE
             )
-        except Exception:
-            logger.exception("DM to assignee failed")
-        self.client.chat_postMessage(
+            if run and effect:
+                wf.transition_with_effect(
+                    run,
+                    effect,
+                    effect_status=effect_status,
+                    remote_ref=create_result.event_id or calendar_url,
+                    error_code=error_code,
+                    calendar_outcome=outcome,
+                    calendar_event_id=create_result.event_id,
+                    calendar_html_link=calendar_url,
+                    result_code=error_code,
+                )
+        return outcome, calendar_url, operation_id
+
+    def _deliver_assignee(
+        self, run_id: int, slack_channel_id: str, thread_ts: str | None
+    ) -> None:
+        with self.session_factory() as session:
+            wf = WorkflowRepository(session)
+            run = wf.get_run(run_id)
+            if (
+                not run
+                or run.state != WorkflowState.ASSIGNEE_SELECTED
+                or not run.assignee_user_id
+                or not run.winning_option_json
+            ):
+                return
+            ch = session.get(Channel, run.channel_id)
+            if not ch:
+                return
+            assignee = run.assignee_user_id
+            winner = json.loads(run.winning_option_json)
+            booking_url = ch.booking_url_template or m.MSG_BOOKING_URL_MISSING
+            dm_effect = wf.get_effect(
+                "workflow_run", str(run_id), OutboundEffectType.ASSIGNEE_DM
+            )
+            if dm_effect and dm_effect.status == OutboundEffectStatus.UNKNOWN:
+                wf.update_run(
+                    run,
+                    state=WorkflowState.NEEDS_ATTENTION,
+                    attention_reason="ASSIGNEE_DM_UNKNOWN",
+                    result_code="ASSIGNEE_DM_UNKNOWN",
+                )
+                return
+            if (
+                dm_effect
+                and dm_effect.status == OutboundEffectStatus.FAILED
+                and dm_effect.attempt_count >= MAX_ASSIGNEE_DM_ATTEMPTS
+            ):
+                wf.update_run(
+                    run,
+                    state=WorkflowState.NEEDS_ATTENTION,
+                    attention_reason="ASSIGNEE_DM_FAILED",
+                    result_code="ASSIGNEE_DM_FAILED",
+                )
+                return
+        calendar_outcome, calendar_url, correlation_id = self._calendar_details(
+            run_id, slack_channel_id
+        )
+        dm_sent = self._post_effect(
+            run_id=run_id,
+            effect_type=OutboundEffectType.ASSIGNEE_DM,
+            channel=assignee,
+            message=render_assignee_dm(
+                run_id=run_id,
+                assignee=assignee,
+                date_iso=winner["date"],
+                booking_url=booking_url,
+                calendar_outcome=calendar_outcome,
+                calendar_url=calendar_url,
+                correlation_id=correlation_id,
+            ),
+        )
+        if not dm_sent:
+            return
+        with self.session_factory() as session:
+            run = WorkflowRepository(session).get_run(run_id)
+            if run:
+                WorkflowRepository(session).record_assignee(
+                    run.channel_id,
+                    assignee,
+                    run_id=run_id,
+                )
+        public_sent = self._post_effect(
+            run_id=run_id,
+            effect_type=OutboundEffectType.ASSIGNEE_PUBLIC_NOTICE,
             channel=slack_channel_id,
             thread_ts=thread_ts,
-            text=f"<@{assignee}> \ub2d8\uc774 \uc774\ubc88 \ud68c\uc2dd \uc608\uc57d \ub2f4\ub2f9\uc785\ub2c8\ub2e4.",
+            message=render_assignee_public(assignee),
         )
+        if not public_sent:
+            with self.session_factory() as session:
+                wf = WorkflowRepository(session)
+                run = wf.get_run(run_id)
+                effect = wf.get_effect(
+                    "workflow_run",
+                    str(run_id),
+                    OutboundEffectType.ASSIGNEE_PUBLIC_NOTICE,
+                )
+                if run and effect and effect.status == OutboundEffectStatus.UNKNOWN:
+                    wf.update_run(
+                        run,
+                        state=WorkflowState.NEEDS_ATTENTION,
+                        attention_reason="ASSIGNEE_PUBLIC_UNKNOWN",
+                        result_code="ASSIGNEE_PUBLIC_UNKNOWN",
+                    )
+
+    def resume_channel(self, slack_channel_id: str) -> None:
+        with self.session_factory() as session:
+            ch = ChannelRepository(session).get_by_channel_id(slack_channel_id)
+            if not ch:
+                return
+            run = WorkflowRepository(session).get_active_run(ch.id)
+            if not run:
+                return
+            run_id = run.id
+            thread_ts = run.thread_ts
+        self._assign_booking(run_id, slack_channel_id, thread_ts)
+
+    def recover_pending_runs(self) -> None:
+        with self.session_factory() as session:
+            runs = WorkflowRepository(session).list_nonterminal_runs()
+            snapshot = [
+                (
+                    run.id,
+                    run.state,
+                    run.poll_deadline,
+                    run.channel.channel_id,
+                    run.thread_ts,
+                )
+                for run in runs
+            ]
+        for run_id, state, deadline, channel_id, thread_ts in snapshot:
+            if state == WorkflowState.POLL_STARTING:
+                self._post_open_poll(run_id, channel_id)
+            elif state == WorkflowState.POLL_OPEN:
+                if deadline:
+                    with self.session_factory() as session:
+                        run = WorkflowRepository(session).get_run(run_id)
+                        ch = session.get(Channel, run.channel_id) if run else None
+                    if ch:
+                        normalized = self._normalize_deadline(deadline, ZoneInfo(ch.tz))
+                        if normalized <= datetime.now(ZoneInfo(ch.tz)):
+                            self.close_poll(run_id)
+                        elif self._schedule_poll_close:
+                            self._schedule_poll_close(run_id, normalized)
+            elif state == WorkflowState.CLOSE_COMPUTED:
+                self._deliver_poll_result(run_id, channel_id, thread_ts)
+            elif state == WorkflowState.ASSIGNEE_SELECTED:
+                self._deliver_assignee(run_id, channel_id, thread_ts)
+            elif state == WorkflowState.NEEDS_ATTENTION:
+                self.resume_channel(channel_id)
 
     def on_booking_done(
         self, run_id: int, user_id: str, *, announce_channel: bool = True
@@ -465,25 +978,54 @@ class WorkflowEngine:
                 return m.MSG_WORKFLOW_NOT_FOUND
             if run.state == WorkflowState.DONE:
                 return m.MSG_ALREADY_DONE
-            if run.state != WorkflowState.BOOKING_ASSIGNED:
+            if run.state != WorkflowState.ASSIGNEE_SELECTED:
                 return m.MSG_BOOKING_NOT_READY
             if run.assignee_user_id and run.assignee_user_id != user_id:
                 return m.MSG_ONLY_ASSIGNEE
             ch = session.get(Channel, run.channel_id)
-            wf.update_run(run, state=WorkflowState.DONE)
             channel_id = ch.channel_id if ch else ""
             thread_ts = run.thread_ts
-        if self._cancel_poll_close:
-            self._cancel_poll_close(run_id)
+            wf.ensure_effect(
+                aggregate_type="workflow_run",
+                aggregate_id=str(run.id),
+                effect_type=OutboundEffectType.BOOKING_DONE_NOTICE,
+                idempotency_key=f"run:{run.id}:booking-done:v1",
+            )
         if announce_channel and channel_id:
-            self.client.chat_postMessage(
+            delivered = self._post_effect(
+                run_id=run_id,
+                effect_type=OutboundEffectType.BOOKING_DONE_NOTICE,
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=(
-                    f"<@{user_id}> \ub2d8\uc774 \uc608\uc57d\uc744 \uc644\ub8cc\ud588\uc2b5\ub2c8\ub2e4. "
-                    "\uc774\ubc88 \ud68c\uc2dd \uc77c\uc815 \ud750\ub984\uc774 \uc885\ub8cc\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
-                ),
+                message=render_booking_done(user_id),
             )
+            if not delivered:
+                with self.session_factory() as session:
+                    wf = WorkflowRepository(session)
+                    run = wf.get_run(run_id)
+                    effect = wf.get_effect(
+                        "workflow_run",
+                        str(run_id),
+                        OutboundEffectType.BOOKING_DONE_NOTICE,
+                    )
+                    if run and effect and effect.status == OutboundEffectStatus.UNKNOWN:
+                        wf.update_run(
+                            run,
+                            state=WorkflowState.NEEDS_ATTENTION,
+                            attention_reason="BOOKING_DONE_NOTICE_UNKNOWN",
+                            result_code="BOOKING_DONE_NOTICE_UNKNOWN",
+                        )
+                return m.MSG_BOOKING_DONE_PENDING
+        with self.session_factory() as session:
+            run = WorkflowRepository(session).get_run(run_id)
+            if run:
+                WorkflowRepository(session).update_run(
+                    run,
+                    state=WorkflowState.DONE,
+                    terminal_reason="BOOKING_COMPLETED",
+                )
+        if self._cancel_poll_close:
+            self._cancel_poll_close(run_id)
         return m.MSG_BOOKING_DONE_OK
 
 
