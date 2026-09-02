@@ -156,6 +156,27 @@ class WorkflowEngine:
     def _is_ambiguous_failure(exc: Exception) -> bool:
         return isinstance(exc, (TimeoutError, ConnectionError))
 
+    @staticmethod
+    def _extract_ts(response: Any) -> str | None:
+        """Extract the message ``ts`` from a Slack API response.
+
+        slack_sdk's ``SlackResponse`` is not a ``dict`` subclass; it exposes a
+        ``get(key)`` method over its payload instead. Checking
+        ``isinstance(response, dict)`` therefore discards a valid ``ts`` from
+        real client responses and misclassifies successful posts as
+        ``SLACK_TS_MISSING``. Duck-type on ``get()`` so both plain dicts and
+        ``SlackResponse`` objects work.
+        """
+        get = getattr(response, "get", None)
+        if not callable(get):
+            return None
+        try:
+            ts = get("ts")
+        except Exception:  # pragma: no cover - defensive for exotic responses
+            return None
+        return str(ts) if ts else None
+
+
     def _post_effect(
         self,
         *,
@@ -221,7 +242,7 @@ class WorkflowEngine:
                     )
             logger.exception("outbound effect failed run_id=%s type=%s", run_id, effect_type)
             return False
-        remote_ref = response.get("ts") if isinstance(response, dict) else None
+        remote_ref = self._extract_ts(response)
         with self.session_factory() as session:
             wf = WorkflowRepository(session)
             effect = wf.get_effect("workflow_run", str(run_id), effect_type)
@@ -331,7 +352,7 @@ class WorkflowEngine:
                     )
             logger.exception("poll post failed run_id=%s", run_id)
             return False
-        thread_ts = response.get("ts") if isinstance(response, dict) else None
+        thread_ts = self._extract_ts(response)
         if not thread_ts:
             with self.session_factory() as session:
                 wf = WorkflowRepository(session)
