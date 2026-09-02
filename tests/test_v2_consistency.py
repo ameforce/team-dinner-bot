@@ -391,6 +391,58 @@ def test_poll_post_timeout_is_unknown_and_retains_claim(factory):
         assert effect.status == OutboundEffectStatus.UNKNOWN
 
 
+class _SlackResponseLike:
+    """Mimics slack_sdk's SlackResponse: dict-like ``get`` but not a ``dict``."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def get(self, key, default=None):
+        return self._payload.get(key, default)
+
+
+def test_poll_open_accepts_slack_sdk_slack_response(factory):
+    client = _slack_client()
+    client.chat_postMessage.return_value = _SlackResponseLike(
+        {"ok": True, "ts": "111.222"}
+    )
+    engine = WorkflowEngine(factory, client)
+
+    assert engine.start_channel_run(CHANNEL) is None
+
+    with factory() as session:
+        run = session.scalar(select(WorkflowRun))
+        effect = session.scalar(select(OutboundEffect))
+        assert run.state == WorkflowState.POLL_OPEN
+        assert run.thread_ts == "111.222"
+        assert effect.status == OutboundEffectStatus.SENT
+        assert effect.remote_ref == "111.222"
+
+
+def test_extract_ts_supports_real_slack_sdk_response():
+    from slack_sdk.web import SlackResponse
+
+    response = SlackResponse(
+        client=None,
+        http_verb="POST",
+        api_url="https://slack.com/api/chat.postMessage",
+        req_args={},
+        data={"ok": True, "ts": "123.456"},
+        headers={},
+        status_code=200,
+    )
+
+    # Locks the library contract the bug depended on: SlackResponse must not
+    # silently become dict-only input for _extract_ts.
+    assert not isinstance(response, dict)
+    assert response.get("ts") == "123.456"
+    assert WorkflowEngine._extract_ts(response) == "123.456"
+    assert WorkflowEngine._extract_ts({"ts": "789.012"}) == "789.012"
+    assert WorkflowEngine._extract_ts({"ok": True}) is None
+    assert WorkflowEngine._extract_ts(None) is None
+    assert WorkflowEngine._extract_ts(object()) is None
+
+
 def test_recovery_does_not_repost_an_attempted_pending_poll(factory):
     client = _slack_client()
     with factory() as session:
